@@ -1,0 +1,134 @@
+global:
+  environment: "production"
+
+eventCollector:
+  replicas: 50
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  hpa:
+    enabled: true
+    minReplicas: 50
+    maxReplicas: 200
+    targetCPU: 70
+  pdb:
+    enabled: true
+    minAvailable: 40
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - event-collector
+            topologyKey: kubernetes.io/hostname
+
+recommendationApi:
+  replicas: 250
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  hpa:
+    enabled: true
+    minReplicas: 250
+    maxReplicas: 1000
+    targetCPU: 70
+  pdb:
+    enabled: true
+    minAvailable: 200
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - recommendation-api
+            topologyKey: kubernetes.io/hostname
+
+streamProcessor:
+  replicas: 25
+  taskManagers: 25
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - stream-processor
+            topologyKey: kubernetes.io/hostname
+
+rankingService:
+  replicas: 8
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+    limits:
+      cpu: "4"
+      memory: "16Gi"
+      nvidia.com/gpu: 1
+  hpa:
+    enabled: true
+    minReplicas: 8
+    maxReplicas: 32
+    targetCPU: 70
+  pdb:
+    enabled: true
+    minAvailable: 6
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  nodeSelector:
+    accelerator: nvidia-gpu
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - ranking-service
+            topologyKey: kubernetes.io/hostname
+
+envoy:
+  replicas: 10
+  service:
+    type: LoadBalancer
+  resources:
+    requests:
+      cpu: "2"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"

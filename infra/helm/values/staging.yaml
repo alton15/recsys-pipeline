@@ -1,0 +1,79 @@
+global:
+  environment: "staging"
+
+eventCollector:
+  replicas: 3
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPU: 75
+  pdb:
+    enabled: true
+    minAvailable: 2
+
+recommendationApi:
+  replicas: 5
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  hpa:
+    enabled: true
+    minReplicas: 5
+    maxReplicas: 20
+    targetCPU: 75
+  pdb:
+    enabled: true
+    minAvailable: 3
+
+streamProcessor:
+  replicas: 3
+  taskManagers: 3
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+
+rankingService:
+  replicas: 3
+  resources:
+    requests:
+      cpu: "1"
+      memory: "4Gi"
+    limits:
+      cpu: "2"
+      memory: "8Gi"
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPU: 75
+  pdb:
+    enabled: true
+    minAvailable: 2
+
+envoy:
+  replicas: 3
+  service:
+    type: LoadBalancer
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"

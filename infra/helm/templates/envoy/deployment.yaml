@@ -1,0 +1,71 @@
+{{- if .Values.envoy.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "recsys.fullname" . }}-envoy
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "envoy") | nindent 4 }}
+spec:
+  replicas: {{ .Values.envoy.replicas }}
+  selector:
+    matchLabels:
+      {{- include "recsys.selectorLabels" (dict "Release" .Release "serviceName" "envoy") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "recsys.selectorLabels" (dict "Release" .Release "serviceName" "envoy") | nindent 8 }}
+      {{- with .Values.envoy.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      containers:
+        - name: envoy
+          image: {{ include "recsys.image" (dict "image" .Values.envoy.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.envoy.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.envoy.service.port }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.envoy.service.adminPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.envoy.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+              readOnly: true
+          {{- with .Values.envoy.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: {{ include "recsys.fullname" . }}-envoy
+      {{- with .Values.envoy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.envoy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.envoy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

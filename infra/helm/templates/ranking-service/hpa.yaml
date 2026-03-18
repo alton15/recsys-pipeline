@@ -1,0 +1,22 @@
+{{- if and .Values.rankingService.enabled .Values.rankingService.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "recsys.fullname" . }}-ranking-service
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "ranking-service") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "recsys.fullname" . }}-ranking-service
+  minReplicas: {{ .Values.rankingService.hpa.minReplicas }}
+  maxReplicas: {{ .Values.rankingService.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.rankingService.hpa.targetCPU }}
+{{- end }}

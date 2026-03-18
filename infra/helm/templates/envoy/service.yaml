@@ -1,0 +1,21 @@
+{{- if .Values.envoy.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "recsys.fullname" . }}-envoy
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "envoy") | nindent 4 }}
+spec:
+  type: {{ .Values.envoy.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.envoy.service.port }}
+      targetPort: http
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.envoy.service.adminPort }}
+      targetPort: admin
+      protocol: TCP
+  selector:
+    {{- include "recsys.selectorLabels" (dict "Release" .Release "serviceName" "envoy") | nindent 4 }}
+{{- end }}

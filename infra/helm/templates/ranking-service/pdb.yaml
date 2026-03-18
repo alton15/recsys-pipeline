@@ -1,0 +1,13 @@
+{{- if and .Values.rankingService.enabled .Values.rankingService.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "recsys.fullname" . }}-ranking-service
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "ranking-service") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.rankingService.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "recsys.selectorLabels" (dict "Release" .Release "serviceName" "ranking-service") | nindent 6 }}
+{{- end }}

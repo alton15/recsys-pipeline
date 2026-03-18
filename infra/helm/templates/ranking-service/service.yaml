@@ -1,0 +1,21 @@
+{{- if .Values.rankingService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "recsys.fullname" . }}-ranking-service
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "ranking-service") | nindent 4 }}
+spec:
+  type: {{ .Values.rankingService.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.rankingService.service.port }}
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.rankingService.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    {{- include "recsys.selectorLabels" (dict "Release" .Release "serviceName" "ranking-service") | nindent 4 }}
+{{- end }}

@@ -1,0 +1,22 @@
+{{- if and .Values.recommendationApi.enabled .Values.recommendationApi.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "recsys.fullname" . }}-recommendation-api
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "recommendation-api") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "recsys.fullname" . }}-recommendation-api
+  minReplicas: {{ .Values.recommendationApi.hpa.minReplicas }}
+  maxReplicas: {{ .Values.recommendationApi.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.recommendationApi.hpa.targetCPU }}
+{{- end }}

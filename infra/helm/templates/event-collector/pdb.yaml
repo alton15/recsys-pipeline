@@ -1,0 +1,13 @@
+{{- if and .Values.eventCollector.enabled .Values.eventCollector.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "recsys.fullname" . }}-event-collector
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "event-collector") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.eventCollector.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "recsys.selectorLabels" (dict "Release" .Release "serviceName" "event-collector") | nindent 6 }}
+{{- end }}

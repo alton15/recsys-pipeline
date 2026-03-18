@@ -1,0 +1,21 @@
+{{- if .Values.recommendationApi.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "recsys.fullname" . }}-recommendation-api
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "recommendation-api") | nindent 4 }}
+spec:
+  type: {{ .Values.recommendationApi.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.recommendationApi.service.port }}
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.recommendationApi.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    {{- include "recsys.selectorLabels" (dict "Release" .Release "serviceName" "recommendation-api") | nindent 4 }}
+{{- end }}

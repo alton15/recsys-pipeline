@@ -1,0 +1,95 @@
+{{- if .Values.envoy.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "recsys.fullname" . }}-envoy
+  labels:
+    {{- include "recsys.serviceLabels" (dict "Release" .Release "Chart" .Chart "serviceName" "envoy") | nindent 4 }}
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: {{ .Values.envoy.service.adminPort }}
+
+    static_resources:
+      listeners:
+        - name: main_listener
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: {{ .Values.envoy.service.port }}
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    codec_type: AUTO
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: event_collector
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: "/api/v1/events"
+                              route:
+                                cluster: event_collector
+                                timeout: 5s
+                            - match:
+                                prefix: "/api/v1/recommendations"
+                              route:
+                                cluster: recommendation_api
+                                timeout: 10s
+                            - match:
+                                prefix: "/api/v1/rankings"
+                              route:
+                                cluster: ranking_service
+                                timeout: 10s
+                    http_filters:
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+      clusters:
+        - name: event_collector
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: event_collector
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: {{ include "recsys.fullname" . }}-event-collector
+                          port_value: {{ .Values.eventCollector.service.port }}
+
+        - name: recommendation_api
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: recommendation_api
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: {{ include "recsys.fullname" . }}-recommendation-api
+                          port_value: {{ .Values.recommendationApi.service.port }}
+
+        - name: ranking_service
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: ranking_service
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: {{ include "recsys.fullname" . }}-ranking-service
+                          port_value: {{ .Values.rankingService.service.port }}
+{{- end }}
