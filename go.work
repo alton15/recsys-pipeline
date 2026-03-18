@@ -1,0 +1,8 @@
+go 1.23
+
+use (
+	./services/event-collector
+	./services/recommendation-api
+	./services/traffic-simulator
+	./shared/go
+)
