@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/recsys-pipeline/recommendation-api/internal/metrics"
 	"github.com/recsys-pipeline/recommendation-api/internal/tier"
 )
 
@@ -61,8 +63,20 @@ func (h *RecommendHandler) HandleRecommend(w http.ResponseWriter, r *http.Reques
 		limit = maxLimit
 	}
 
+	start := time.Now()
 	items, level, err := h.recommender.Recommend(userID, sessionID, limit)
+	duration := time.Since(start).Seconds()
+
+	tierLabel := string(level)
+	if tierLabel == "" {
+		tierLabel = "unknown"
+	}
+
+	metrics.RequestsTotal.WithLabelValues(tierLabel).Inc()
+	metrics.RequestDuration.WithLabelValues(tierLabel).Observe(duration)
+
 	if err != nil {
+		metrics.ErrorsTotal.WithLabelValues(tierLabel).Inc()
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}

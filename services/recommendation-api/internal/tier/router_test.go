@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/recsys-pipeline/recommendation-api/internal/degradation"
 	"github.com/recsys-pipeline/recommendation-api/internal/tier"
 )
 
@@ -195,5 +196,67 @@ func TestRouter_StoreError(t *testing.T) {
 
 	if err == nil {
 		t.Error("expected error when store fails")
+	}
+}
+
+func TestRouter_EmergencySkipsTiers(t *testing.T) {
+	store := &mockStore{
+		recs: []tier.Recommendation{{ItemID: "item1", Score: 0.9}},
+		popular: []tier.Recommendation{
+			{ItemID: "pop1", Score: 100},
+			{ItemID: "pop2", Score: 90},
+		},
+	}
+	checker := &mockStockChecker{oosItems: map[string]bool{}}
+	reranker := &mockReranker{}
+
+	dm := degradation.NewManager()
+	dm.SetLevel(degradation.Emergency)
+
+	router := tier.NewRouterWithDegradation(store, checker, reranker, dm)
+	items, level, err := router.Recommend("user1", "session1", 10)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if level != tier.Fallback {
+		t.Errorf("expected fallback level, got %s", level)
+	}
+	if len(items) != 2 {
+		t.Errorf("expected 2 popular items, got %d", len(items))
+	}
+	if reranker.called {
+		t.Error("reranker should NOT have been called in emergency mode")
+	}
+}
+
+func TestRouter_CriticalSkipsTier2(t *testing.T) {
+	store := &mockStore{
+		recs: []tier.Recommendation{
+			{ItemID: "item1", Score: 0.9},
+			{ItemID: "item2", Score: 0.8},
+		},
+	}
+	checker := &mockStockChecker{oosItems: map[string]bool{}}
+	reranker := &mockReranker{}
+
+	dm := degradation.NewManager()
+	dm.SetLevel(degradation.Critical)
+
+	router := tier.NewRouterWithDegradation(store, checker, reranker, dm)
+	items, level, err := router.Recommend("user1", "session1", 10)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should stay Tier1 since Tier2 reranking is blocked.
+	if level != tier.Tier1 {
+		t.Errorf("expected tier1 level, got %s", level)
+	}
+	if len(items) != 2 {
+		t.Errorf("expected 2 items, got %d", len(items))
+	}
+	if reranker.called {
+		t.Error("reranker should NOT have been called at Critical level")
 	}
 }

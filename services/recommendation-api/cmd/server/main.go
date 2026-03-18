@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"github.com/recsys-pipeline/recommendation-api/internal/degradation"
 	"github.com/recsys-pipeline/recommendation-api/internal/handler"
 	"github.com/recsys-pipeline/recommendation-api/internal/rerank"
 	"github.com/recsys-pipeline/recommendation-api/internal/stock"
@@ -41,13 +42,18 @@ func main() {
 	scorer := rerank.NewWeightedScorer(rerank.DefaultWeights())
 	reranker := rerank.NewSessionReranker(extractor, scorer)
 
-	router := tier.NewRouter(dfStore, bitmapChecker, reranker)
+	// Degradation state machine for graceful degradation under load.
+	degradationMgr := degradation.NewManager()
+
+	router := tier.NewRouterWithDegradation(dfStore, bitmapChecker, reranker, degradationMgr)
 
 	h := handler.NewRecommendHandler(router)
+	ph := handler.NewPopularHandler(dfStore)
 
 	// Application server.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/recommend", h.HandleRecommend)
+	mux.HandleFunc("/api/v1/popular", ph.HandlePopular)
 	mux.HandleFunc("/health", h.HandleHealth)
 
 	appServer := &http.Server{

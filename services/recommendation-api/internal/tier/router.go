@@ -1,14 +1,23 @@
 package tier
 
+import "github.com/recsys-pipeline/recommendation-api/internal/degradation"
+
+// DegradationChecker allows the router to query the current degradation state.
+type DegradationChecker interface {
+	IsTierAllowed(tierName string) bool
+}
+
 // Router orchestrates the multi-tier recommendation pipeline.
 type Router struct {
-	store   Store
-	stock   StockChecker
-	reranker Reranker
+	store       Store
+	stock       StockChecker
+	reranker    Reranker
+	degradation DegradationChecker
 }
 
 // NewRouter creates a Router. The reranker parameter may be nil if Tier 2
-// re-ranking is not yet available.
+// re-ranking is not yet available. The degradation parameter may be nil to
+// allow all tiers unconditionally.
 func NewRouter(store Store, stock StockChecker, reranker Reranker) *Router {
 	return &Router{
 		store:    store,
@@ -17,9 +26,43 @@ func NewRouter(store Store, stock StockChecker, reranker Reranker) *Router {
 	}
 }
 
+// NewRouterWithDegradation creates a Router with a degradation manager.
+func NewRouterWithDegradation(store Store, stock StockChecker, reranker Reranker, dm *degradation.Manager) *Router {
+	return &Router{
+		store:       store,
+		stock:       stock,
+		reranker:    reranker,
+		degradation: dm,
+	}
+}
+
+// isTierAllowed checks whether the given tier is allowed. If no degradation
+// checker is configured, all tiers are allowed.
+func (r *Router) isTierAllowed(tierName string) bool {
+	if r.degradation == nil {
+		return true
+	}
+	return r.degradation.IsTierAllowed(tierName)
+}
+
 // Recommend returns up to `limit` recommendations for the given user,
 // along with the tier that produced the result.
 func (r *Router) Recommend(userID, sessionID string, limit int) ([]Recommendation, Level, error) {
+	// Emergency: skip all tiers, return popular items directly.
+	if !r.isTierAllowed("tier1") {
+		recs, err := r.store.GetPopularItems(limit)
+		if err != nil {
+			return nil, "", err
+		}
+		if recs == nil {
+			recs = []Recommendation{}
+		}
+		if len(recs) > limit {
+			recs = recs[:limit]
+		}
+		return recs, Fallback, nil
+	}
+
 	// Step 1: Try pre-computed recommendations (Tier 1).
 	recs, err := r.store.GetRecommendations(userID)
 	if err != nil {
@@ -43,8 +86,8 @@ func (r *Router) Recommend(userID, sessionID string, limit int) ([]Recommendatio
 		return nil, "", err
 	}
 
-	// Step 4: If session context is available and reranker is configured, re-rank.
-	if sessionID != "" && r.reranker != nil {
+	// Step 4: If session context is available, reranker is configured, and tier2 is allowed, re-rank.
+	if sessionID != "" && r.reranker != nil && r.isTierAllowed("tier2") {
 		recs, err = r.reranker.Rerank(userID, sessionID, recs)
 		if err != nil {
 			return nil, "", err
