@@ -2,10 +2,12 @@ package handler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/recsys-pipeline/recommendation-api/internal/experiment"
 	"github.com/recsys-pipeline/recommendation-api/internal/metrics"
 	"github.com/recsys-pipeline/recommendation-api/internal/tier"
 )
@@ -20,20 +22,36 @@ type Recommender interface {
 	Recommend(userID, sessionID string, limit int) ([]tier.Recommendation, tier.Level, error)
 }
 
+// ExperimentAssigner assigns users to A/B experiments.
+type ExperimentAssigner interface {
+	GetExperiment(userID string) (*experiment.Experiment, error)
+}
+
 // RecommendResponse is the JSON envelope returned to clients.
 type RecommendResponse struct {
-	Items []tier.Recommendation `json:"items"`
-	Tier  string                `json:"tier"`
+	Items        []tier.Recommendation `json:"items"`
+	Tier         string                `json:"tier"`
+	ExperimentID string                `json:"experiment_id,omitempty"`
+	ModelVersion string                `json:"model_version,omitempty"`
 }
 
 // RecommendHandler handles HTTP requests for recommendations.
 type RecommendHandler struct {
-	recommender Recommender
+	recommender  Recommender
+	experimenter ExperimentAssigner
 }
 
 // NewRecommendHandler creates a RecommendHandler with the given recommender.
 func NewRecommendHandler(r Recommender) *RecommendHandler {
 	return &RecommendHandler{recommender: r}
+}
+
+// WithExperiments returns a new RecommendHandler with experiment routing enabled.
+func (h *RecommendHandler) WithExperiments(e ExperimentAssigner) *RecommendHandler {
+	return &RecommendHandler{
+		recommender:  h.recommender,
+		experimenter: e,
+	}
 }
 
 // HandleRecommend serves GET /api/v1/recommend.
@@ -88,6 +106,19 @@ func (h *RecommendHandler) HandleRecommend(w http.ResponseWriter, r *http.Reques
 	resp := RecommendResponse{
 		Items: items,
 		Tier:  string(level),
+	}
+
+	// Assign A/B experiment if experimenter is configured.
+	if h.experimenter != nil {
+		exp, expErr := h.experimenter.GetExperiment(userID)
+		if expErr != nil {
+			log.Printf("experiment assignment error for user %s: %v", userID, expErr)
+		}
+		if exp != nil {
+			resp.ExperimentID = exp.ID
+			resp.ModelVersion = exp.ModelVersion
+			log.Printf("experiment assignment: user=%s experiment=%s model=%s", userID, exp.ID, exp.ModelVersion)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

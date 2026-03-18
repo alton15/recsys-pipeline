@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/recsys-pipeline/recommendation-api/internal/degradation"
+	"github.com/recsys-pipeline/recommendation-api/internal/experiment"
 	"github.com/recsys-pipeline/recommendation-api/internal/handler"
 	"github.com/recsys-pipeline/recommendation-api/internal/rerank"
 	"github.com/recsys-pipeline/recommendation-api/internal/stock"
@@ -47,7 +48,10 @@ func main() {
 
 	router := tier.NewRouterWithDegradation(dfStore, bitmapChecker, reranker, degradationMgr)
 
-	h := handler.NewRecommendHandler(router)
+	// A/B experiment routing backed by DragonflyDB.
+	expRouter := experiment.NewRouter(dfStore)
+
+	h := handler.NewRecommendHandler(router).WithExperiments(expRouter)
 	ph := handler.NewPopularHandler(dfStore)
 
 	// Application server.

@@ -46,3 +46,6 @@ func SessionEvents(sessionID string) string {
 
 // ExperimentConfig returns the key for an A/B experiment configuration.
 func ExperimentConfig(expID string) string { return fmt.Sprintf("experiment:%s", expID) }
+
+// ExperimentActiveList returns the key for the set of active experiment IDs.
+func ExperimentActiveList() string { return "experiment:active" }
