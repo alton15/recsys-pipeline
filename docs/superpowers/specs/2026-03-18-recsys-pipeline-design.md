@@ -27,12 +27,17 @@
 
 핵심 설계 원칙: **실시간 GPU 추론을 전체 트래픽의 3% 이하로 제한**
 
-| Tier | 대상 | 처리 방식 | 지연시간 | 트래픽 비중 |
-|------|------|----------|---------|------------|
-| Tier 0 | 비로그인, 신규 유저 | CDN 캐시 (인기/트렌딩) | < 1ms | 70% |
-| Tier 1 | 로그인 유저 | DragonflyDB pre-computed 조회 + 품절 필터 | < 5ms | ~25.5% |
-| Tier 2 | 세션 행동 있는 유저 | CPU GBDT 경량 re-ranking | < 20ms | ~3.6% |
-| Tier 3 | 캐시 미스, 콜드스타트 | GPU 추론 (Two-Tower + DCN-V2, INT8) | < 80ms | ~0.9% |
+**전체 500K RPS 기준:**
+
+| Tier | 대상 | 처리 방식 | 지연시간 | 전체 대비 | 실제 RPS |
+|------|------|----------|---------|----------|---------|
+| Tier 0 | 비로그인, 신규 유저 (~70% 가정) | CDN 캐시 (인기/트렌딩) | < 1ms | 70% | 350K |
+| Tier 1 | 로그인 유저 (배치 갱신 후) | DragonflyDB pre-computed 조회 + 품절 필터 | < 5ms | ~25.5% | ~127.5K |
+| Tier 2 | 세션 행동 있는 유저 | CPU GBDT 경량 re-ranking | < 20ms | ~3.6% | ~18K |
+| Tier 3 | 캐시 미스, 콜드스타트, 실험군 | GPU 추론 (Two-Tower + DCN-V2, INT8) | < 80ms | ~0.9% | ~4.5K |
+
+> **참고**: Tier 0(CDN) 이후 Envoy를 통과하는 150K RPS 기준으로 보면 Tier1=85%, Tier2=12%, Tier3=3%.
+> 70% CDN 흡수율은 비로그인 + 7일 이내 재방문 없는 유저 + 카테고리별 인기 프리셋 캐싱 기준.
 
 ### 4-Plane Architecture
 
@@ -79,7 +84,7 @@
 recommendation-api(Go) 내부에서 직접 처리:
 
 - DragonflyDB 직접 조회 (feature + candidates + stock bitmap) → 1 네트워크 홉
-- 로컬 GBDT re-ranking (CGo embedded) → 0 네트워크 홉
+- 로컬 GBDT re-ranking (pure Go: leaves 라이브러리, CGo 회피) → 0 네트워크 홉
 - Tier3일 때만 Triton gRPC 호출 → 1 네트워크 홉
 
 결과: 네트워크 홉 6+ → 1~2, p99 57ms+ → 15ms (Tier1)
@@ -170,6 +175,157 @@ GPU 기반 딥러닝 모델 추론. Tier3 전용.
 
 ---
 
+## Data Models & Schemas
+
+### Event Schema
+
+```json
+{
+  "event_id": "uuid-v7",
+  "user_id": "u_abc123",
+  "event_type": "click | view | purchase | search | add_to_cart | remove_from_cart",
+  "item_id": "i_xyz789",
+  "category_id": "cat_electronics",
+  "timestamp": "2026-03-18T10:30:00Z",
+  "session_id": "sess_def456",
+  "metadata": {
+    "query": "wireless earbuds",
+    "position": 3,
+    "price": 29900,
+    "source": "search | category | recommendation | home"
+  }
+}
+```
+
+Redpanda 토픽: `user-events` (파티션 키: user_id), `inventory-events` (파티션 키: item_id)
+
+### DragonflyDB Key Patterns
+
+```
+# Pre-computed 추천 (Tier 1)
+rec:{user_id}:top_k        → JSON array of {item_id, score} (Top-100, ~1KB)
+rec:{user_id}:ttl           → 마지막 배치 갱신 시각
+
+# 실시간 피처 (Flink → Dragonfly)
+feat:user:{user_id}:clicks_1h    → int (1시간 클릭 수)
+feat:user:{user_id}:views_1d     → int (1일 조회 수)
+feat:user:{user_id}:recent_items → list of last 20 item_ids
+feat:item:{item_id}:ctr_7d       → float (7일 CTR)
+feat:item:{item_id}:popularity   → float (실시간 트렌드 스코어)
+
+# 품절 비트맵
+stock:bitmap                → Redis bitmap (bit position = item_id의 sequential index)
+stock:id_map:{item_id}      → int (item_id → bitmap bit position 매핑)
+stock:next_bit_pos           → int (다음 할당할 bit position, 아이템 추가 시 증가)
+
+# 세션 컨텍스트
+session:{session_id}:events → sorted set (timestamp score, event JSON)
+```
+
+### Feature Vector Schema
+
+- 유저 임베딩: 128차원 float32 (Two-Tower 모델 출력)
+- 아이템 임베딩: 128차원 float32 (Two-Tower 모델 출력)
+- 컨텍스트 피처: 32차원 (시간대, 디바이스, 카테고리 원핫 등)
+
+---
+
+## Capacity Planning
+
+### Pre-compute Pipeline (배치)
+
+```
+대상: 50M 유저 × Top-100 아이템
+데이터 크기: 50M × 1KB ≈ 50GB (DragonflyDB 메모리)
+쓰기 처리량: 50M keys / 4시간 증분 주기 ≈ 3,500 writes/sec (충분)
+
+전체 재계산 (일 1회):
+  - Two-Tower 임베딩 생성: ~2시간 (Spark 50 executors)
+  - ANN 검색 (Milvus batch): ~1시간
+  - DragonflyDB bulk load: ~1시간 (pipeline mode, 50K writes/sec)
+  - 총 소요: ~4시간
+
+증분 갱신 (4시간마다):
+  - 대상: 지난 4시간 활성 유저 (~5M, 전체의 10%)
+  - 소요: ~30분
+```
+
+### DragonflyDB 메모리 산정
+
+```
+Pre-computed 추천: 50GB
+실시간 피처 (활성 유저 10M): ~10GB
+품절 비트맵 (10M 아이템): ~1.2MB (무시 가능)
+세션 컨텍스트 (동시접속 5M): ~5GB
+합계: ~65GB
+
+15노드 × 64GB = 960GB 가용 → 충분 (활용률 ~7%)
+실제 필요 노드: 5~8노드 (장애 대비 + throughput 목적)
+```
+
+> **DragonflyDB throughput 보정**: 4M+ ops/sec는 64 vCPU 벤치마크 기준.
+> 프로덕션 8 CPU 인스턴스에서는 **500K~800K ops/sec** 현실적.
+> 150K RPS × 3 ops/request = 450K ops/sec → 8 CPU 노드 2대로 충분.
+> 15노드는 HA + 장애 대비 over-provisioning. 실제로는 **8~10노드** 권장.
+
+### Milvus Sizing
+
+```
+아이템 수: 10M (프로덕션 가정)
+벡터 차원: 128 float32
+인덱스 타입: HNSW (recall 95%+, 빌드 느리지만 검색 빠름)
+메모리: 10M × 128 × 4 bytes = ~5GB (인덱스 오버헤드 포함 ~15GB)
+
+QPS: ~4.5K (Tier3 only, 오프라인 배치 빌드 + 온라인 검색 분리)
+필요 노드: HNSW 기준 노드당 ~2K QPS → 5~8 노드 충분
+(기존 30노드 → 8노드로 축소, $12K → $3.2K/월)
+```
+
+---
+
+## A/B Testing & Model Rollout
+
+### 실험 프레임워크
+
+```
+recommendation-api 내 A/B 라우팅:
+  1. 유저 ID hash → 실험 버킷 할당 (consistent hashing)
+  2. 실험 설정 (DragonflyDB): experiment:{id} → {model_version, tier_config, traffic_pct}
+  3. 메트릭 수집: 추천 결과 + 유저 행동 → Redpanda → Flink → 실험 분석
+
+라우팅 예시:
+  experiment_001: model_v2, traffic 5%
+  experiment_002: new_reranker, traffic 10%
+  control:        model_v1, traffic 85%
+```
+
+### 모델 배포 전략
+
+```
+1. Shadow Mode:  새 모델로 추론하되 결과 미반환, 기존 모델과 비교 로깅만
+2. Canary (1%):  소수 유저에게만 새 모델 결과 서빙, 핵심 메트릭 모니터링
+3. Ramp-up:      1% → 5% → 20% → 50% → 100% (각 단계 최소 24시간)
+4. Rollback:     CTR 5%+ 하락 또는 error rate 0.1%+ 시 자동 롤백
+
+핵심 메트릭:
+  - CTR (Click-Through Rate)
+  - Conversion Rate
+  - Revenue per Session
+  - 추천 다양성 (Intra-List Diversity)
+  - 추천 커버리지 (전체 아이템 중 추천된 비율)
+```
+
+---
+
+## Data Privacy
+
+- 유저 행동 데이터는 PII로 간주, user_id는 내부 해시 ID (실명/이메일 미포함)
+- 이벤트 로그 보존: Hot 30일, Warm 90일, Cold 1년 후 삭제
+- DragonflyDB 피처: TTL 기반 자동 만료 (비활성 유저 7일 후 삭제)
+- 임베딩 벡터: 역추론 불가하나, 접근 제어 적용
+
+---
+
 ## Real-time Inventory Pipeline
 
 품절/가격 변동을 실시간으로 추천에 반영:
@@ -202,7 +358,7 @@ Emergency      전체 CDN 캐시 서빙 (static fallback)
 ```
 
 - Envoy Adaptive Concurrency Limit
-- 각 Tier 독립 Circuit Breaker (Hystrix 패턴)
+- 각 Tier 독립 Circuit Breaker (Envoy 내장 circuit breaker)
 - Rate Limiting: 유저당 + 글로벌
 
 ---
@@ -221,7 +377,7 @@ Emergency      전체 CDN 캐시 서빙 (static fallback)
 - Ramp-up: 1K → 10K → 50K → 100K RPS
 - p50/p95/p99 latency, error rate < 0.01%
 - Tier별 트래픽 분배 비율 검증
-- Kafka consumer lag 모니터링
+- Redpanda consumer lag 모니터링
 
 ### Stage 3: Chaos Engineering
 
@@ -243,12 +399,34 @@ Emergency      전체 CDN 캐시 서빙 (static fallback)
 
 ## Cost Summary
 
+### 전체 항목별 비용 (월 기준, 1차 최적화 적용)
+
+| 컴포넌트 | 스펙 | 수량 | 단가(월) | 소계 |
+|----------|------|------|---------|------|
+| Redpanda | 8 CPU, 32GB | 12 | $500 | $6,000 |
+| DragonflyDB | 8 CPU, 64GB | 10 | $450 | $4,500 |
+| Flink TaskManager | 4 CPU, 8GB | 25 | $200 | $5,000 |
+| GPU (Triton) | L4 24GB | 8 | $600 | $4,800 |
+| recommendation-api | 4 CPU, 8GB | 250 | $100 | $25,000 |
+| event-collector | 2 CPU, 4GB | 50 | $50 | $2,500 |
+| Milvus | 8 CPU, 32GB | 8 | $400 | $3,200 |
+| Spark (배치, Spot) | on-demand | - | - | $4,500 |
+| MinIO | - | 클러스터 | - | $3,000 |
+| PostgreSQL HA | - | 3노드 | - | $1,500 |
+| Airflow + MLflow | - | - | - | $1,000 |
+| 네트워크/LB/CDN | - | - | - | $20,000 |
+| 모니터링 스택 | - | - | - | $3,000 |
+| **합계** | | | | **$84,000** |
+| **원화 (1,400원)** | | | | **~1.18억 원** |
+
+### 최적화 단계별 비용
+
 | 단계 | 월 비용 | 비고 |
 |------|--------|------|
-| 최적화 전 | ~4억 원 | Kafka + Redis + A100 |
-| 1차 최적화 | ~1.5억 원 | Redpanda + DragonflyDB + L4 INT8 |
-| 2차 최적화 | ~1.1억 원 | Edge + 피처 계층화 |
-| 극한 최적화 | ~0.9억 원 | Student 모델 CPU 서빙 |
+| 최적화 전 | ~4억 원 ($285K) | Kafka 50 + Redis 100 + A100 ×20 |
+| 1차 최적화 | **~1.18억 원 ($84K)** | Redpanda + DragonflyDB + L4 INT8 + Milvus 축소 |
+| 2차 최적화 | ~0.9억 원 ($64K) | Edge + 피처 계층화 + Dragonfly 노드 축소 |
+| 극한 최적화 | ~0.7억 원 ($50K) | Student 모델 CPU 서빙 (GPU 제거) |
 
 ---
 

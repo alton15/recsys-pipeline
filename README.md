@@ -17,7 +17,7 @@ Building a personalization engine for tens of millions of users is one of the ha
 | Peak RPS | 500K |
 | p99 Latency | < 100ms (Tier 1: < 5ms) |
 | GPU Inference RPS | ~4.5K (0.9% of traffic) |
-| Estimated Monthly Cost | ~$107K (~1.5억 원) |
+| Estimated Monthly Cost | ~$84K (~1.18억 원) |
 
 ---
 
@@ -55,6 +55,9 @@ The core insight: **don't run GPU inference on every request.** Pre-compute resu
      ~85%             ~12%              ~3%
      < 5ms            < 20ms            < 80ms
 ```
+
+> Tier percentages above are of the 150K RPS that pass CDN (post-Tier 0).
+> Of total 500K RPS: Tier 0=70%, Tier 1=25.5%, Tier 2=3.6%, Tier 3=0.9%.
 
 ### 4-Plane Architecture
 
@@ -139,7 +142,7 @@ recsys-pipeline/
 | **Event Streaming** | Redpanda | Kafka-compatible, C++ native. 1M+ msg/s per broker — 70% fewer nodes than Kafka. No JVM, no ZooKeeper. |
 | **Stream Processing** | Apache Flink | Exactly-once guarantees, sliding window aggregation, session gap detection. |
 | **Batch Processing** | Apache Spark | Battle-tested for large-scale feature engineering and ETL. |
-| **Cache / Feature Store** | DragonflyDB | Multi-threaded, Redis protocol compatible. 4M+ ops/sec per node — 85% fewer nodes than Redis. |
+| **Cache / Feature Store** | DragonflyDB | Multi-threaded, Redis protocol compatible. 500K-800K ops/sec per 8-CPU node — 85% fewer nodes than Redis. |
 | **Vector Search** | Milvus | Open-source distributed ANN. Handles billion-scale embeddings. |
 | **ML Training** | PyTorch + DeepSpeed | Distributed training, large model support, active community. |
 | **Model Serving** | NVIDIA Triton + TensorRT | Dynamic batching, INT8 quantization (3-4x throughput), gRPC. |
@@ -193,16 +196,21 @@ Critical(200%)→  Tier 2 disabled
 Emergency     →  CDN static fallback
 ```
 
-Each tier has an independent circuit breaker.
+Each tier has an independent circuit breaker (Envoy built-in, not Hystrix).
 
 ### 4. Cost Optimization: Redpanda + DragonflyDB + L4 INT8
 
 | Component | Before | After | Savings |
 |-----------|--------|-------|---------|
 | Message Broker | Kafka 50 nodes ($25K) | Redpanda 12 nodes ($6K) | -76% |
-| Cache | Redis 100 nodes ($30K) | DragonflyDB 15 nodes ($6.75K) | -78% |
+| Cache | Redis 100 nodes ($30K) | DragonflyDB 10 nodes ($4.5K) | -85% |
 | GPU Inference | A100×20 ($60K) | L4 INT8×8 ($4.8K) | -92% |
-| **Total infra** | **$285K/mo** | **$107K/mo** | **-62%** |
+| Vector Search | Milvus 50 nodes ($20K) | Milvus 8 nodes ($3.2K) | -84% |
+| API Servers | 500 pods ($50K) | 250 pods ($25K) | -50% |
+| Stream Processing | Flink 100 TM ($40K) | Flink 25 TM ($5K) | -88% |
+| Batch (Spark) | On-demand ($15K) | Spot ($4.5K) | -70% |
+| Other (storage, net, mon.) | $45K | $27.5K | -39% |
+| **Total infra** | **$285K/mo** | **$84K/mo** | **-71%** |
 
 ---
 
@@ -211,7 +219,7 @@ Each tier has an independent circuit breaker.
 ### Prerequisites
 
 - Docker & Docker Compose v2
-- 16GB+ RAM (32GB recommended)
+- 32GB+ RAM (16GB may work with reduced services)
 - GPU optional (CPU fallback for Triton)
 
 ### Run Locally
@@ -311,9 +319,9 @@ make health-check-k8s
 | stream-processor (Flink) | 25 TM | 4 CPU, 8GB |
 | recommendation-api | 250 | 4 CPU, 8GB |
 | ranking-service (Triton) | 8 | L4 GPU, 16GB |
-| DragonflyDB | 15 nodes | 8 CPU, 64GB |
+| DragonflyDB | 10 nodes | 8 CPU, 64GB |
 | Redpanda | 12 brokers | 8 CPU, 32GB |
-| Milvus | 30 nodes | 8 CPU, 32GB |
+| Milvus | 8 nodes | 8 CPU, 32GB |
 
 ---
 
