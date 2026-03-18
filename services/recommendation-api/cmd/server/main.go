@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"github.com/recsys-pipeline/recommendation-api/internal/handler"
+	"github.com/recsys-pipeline/recommendation-api/internal/rerank"
 	"github.com/recsys-pipeline/recommendation-api/internal/stock"
 	"github.com/recsys-pipeline/recommendation-api/internal/store"
 	"github.com/recsys-pipeline/recommendation-api/internal/tier"
@@ -26,8 +28,20 @@ func main() {
 	bitmapChecker := stock.NewBitmapChecker(dragonflyAddr)
 	defer bitmapChecker.Close()
 
-	// No reranker for Tier 1 — will be added in Task 6.
-	router := tier.NewRouter(dfStore, bitmapChecker, nil)
+	// Tier 2: session-aware weighted re-ranking.
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:         dragonflyAddr,
+		ReadTimeout:  10 * time.Millisecond,
+		WriteTimeout: 10 * time.Millisecond,
+		PoolSize:     100,
+	})
+	defer redisClient.Close()
+
+	extractor := rerank.NewSessionFeatureExtractor(redisClient)
+	scorer := rerank.NewWeightedScorer(rerank.DefaultWeights())
+	reranker := rerank.NewSessionReranker(extractor, scorer)
+
+	router := tier.NewRouter(dfStore, bitmapChecker, reranker)
 
 	h := handler.NewRecommendHandler(router)
 
