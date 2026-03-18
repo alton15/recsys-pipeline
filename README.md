@@ -1,5 +1,7 @@
 # recsys-pipeline
 
+[한국어 README](README.ko.md)
+
 Production-grade recommendation system pipeline for 50M DAU commerce services.
 
 A cloud-agnostic reference architecture that runs locally with `docker-compose up` and scales to 500K RPS on Kubernetes.
@@ -307,6 +309,8 @@ recsys-pipeline/
 | **2-Plane** (Online/Offline) | Serving/training separated | No real-time features | 10M DAU max |
 | **4-Plane** (Data/Stream/Batch/Control) | Independent scaling per plane | Higher operational complexity | **50M DAU required** |
 
+**Decision:** At 50M DAU, serving and training compete for CPU/GPU/memory. Stream processing must run independently to maintain sub-second feature freshness. The 4-Plane model lets each plane autoscale on its own resource profile — serving scales on CPU, stream on memory, batch on spot instances, control on minimal always-on nodes.
+
 ### Why 3-Tier Serving?
 
 | Approach | GPU Usage | p99 Latency | Monthly Cost |
@@ -315,6 +319,8 @@ recsys-pipeline/
 | Pre-compute only | 0 GPU | < 5ms | Low, but stale |
 | **3-Tier hybrid** | 4.5K RPS (0.9%) | Tier1: 5ms, Tier3: 80ms | **$4.8K (GPU)** |
 
+**Decision:** Running GPU inference on every request at 500K RPS requires 100+ A100 GPUs ($60K+/mo). Pre-compute covers 85% of users; CPU re-ranking handles 12% with session context; GPU is reserved for the 3% cold-start/experiment traffic. This reduces GPU cost by 92% while maintaining personalization quality.
+
 ### Why Embedded Architecture (Fan-out Elimination)?
 
 | Approach | Network Hops | p99 Latency | Failure Mode |
@@ -322,6 +328,143 @@ recsys-pipeline/
 | Microservice fan-out | 6+ | ~57ms | Single service failure cascades |
 | Service mesh (Istio) | 6+ (sidecar added) | ~70ms+ | Sidecar overhead |
 | **Embedded** (direct) | 1-2 | ~15ms | DragonflyDB single dependency |
+
+**Decision:** Traditional recommendation architectures fan out to 3-5 microservices (feature store, candidate generation, ranking, filtering). Each hop adds ~8-12ms network latency. By embedding feature lookup, re-ranking, and filtering directly in the Go orchestrator, we collapse 6+ hops to 1-2 DragonflyDB reads. The tradeoff is a thicker API binary, but Go's compilation model keeps deployment simple.
+
+---
+
+## Tech Stack Selection Rationale
+
+Every technology was chosen through explicit comparison. Below are the alternatives considered, their strengths, and why the final choice was made.
+
+### 1. API Language: Go
+
+| Candidate | Throughput (RPS/core) | p99 Latency | Memory | Binary Deploy | Ecosystem |
+|-----------|----------------------|-------------|--------|---------------|-----------|
+| **Go 1.23** | ~50K | ~2ms | ~30MB | Single static binary | Strong infra ecosystem |
+| Rust | ~60K | ~1.5ms | ~20MB | Single binary | Steep learning curve, slower iteration |
+| Java (Spring) | ~15K | ~10ms | ~500MB+ | JVM + JAR | Mature, but GC pauses at tail latency |
+| Node.js | ~8K | ~15ms | ~100MB | Runtime required | Poor CPU-bound perf |
+
+**Why Go:** Comparable throughput to Rust with significantly faster development velocity. Single binary deployment eliminates JVM/runtime dependencies. Goroutine model maps naturally to the embedded architecture (concurrent DragonflyDB reads + local re-ranking). Java was rejected due to GC-induced tail latency spikes at p99, which violates the <5ms Tier 1 SLA.
+
+### 2. Event Streaming: Redpanda vs Kafka
+
+| Criteria | Apache Kafka | **Redpanda** | Pulsar |
+|----------|-------------|-------------|--------|
+| Language | Java/Scala (JVM) | C++ (thread-per-core) | Java (JVM) |
+| Nodes for 500K msg/s | ~50 brokers | **~12 brokers** | ~40 brokers |
+| Tail latency (p99) | 10-50ms (GC pauses) | **<5ms** (no GC) | 15-60ms |
+| Kafka API compatible | Native | **Yes** | No (own protocol) |
+| Operational overhead | ZooKeeper/KRaft | **Self-contained** | ZooKeeper + BookKeeper |
+| Cost (50M DAU) | ~$25K/mo | **~$6K/mo** | ~$20K/mo |
+| Community/Ecosystem | Largest | Growing fast | Medium |
+
+**Why Redpanda:** 76% cost reduction over Kafka with the same API compatibility. C++ thread-per-core eliminates JVM GC pauses that cause p99 spikes. Self-contained deployment (no ZooKeeper) reduces operational complexity. All Kafka client libraries (franz-go, librdkafka) work unchanged. The tradeoff is a smaller ecosystem, but for our event streaming use case (high-throughput ingestion, Flink consumption), Redpanda's feature set is sufficient.
+
+### 3. Cache / Feature Store: DragonflyDB vs Redis
+
+| Criteria | Redis 7 | **DragonflyDB** | KeyDB | Garnet |
+|----------|---------|----------------|-------|--------|
+| Threading model | Single-threaded | **Multi-threaded (shared-nothing)** | Multi-threaded | Multi-threaded (.NET) |
+| Throughput/node (8 CPU) | ~100K ops/s | **500-800K ops/s** | ~200K ops/s | ~300K ops/s |
+| Nodes for 4M ops/s | ~100 (clustered) | **~10** | ~40 | ~30 |
+| Redis protocol compatible | Native | **Yes** | Yes | Yes |
+| Memory efficiency | 1x | **~0.7x (Dash hash)** | 1x | ~0.8x |
+| Persistence | RDB/AOF | Snapshots + WAL | RDB/AOF | RDB/AOF |
+| Cost (50M DAU) | ~$30K/mo | **~$4.5K/mo** | ~$12K/mo | ~$9K/mo |
+
+**Why DragonflyDB:** 85% cost reduction vs Redis cluster. Multi-threaded shared-nothing architecture achieves 5-8x throughput per node, requiring 10 nodes instead of 100. Full Redis protocol compatibility means zero code changes — all Go Redis clients (go-redis, rueidis) work as-is. The Dash hash table provides 30% better memory efficiency. The tradeoff is less battle-tested than Redis at extreme scale, but DragonflyDB's architecture is fundamentally better suited for our workload (high read throughput, feature store pattern).
+
+### 4. Vector Search: Milvus vs Alternatives
+
+| Criteria | **Milvus** | Qdrant | Weaviate | Pinecone |
+|----------|-----------|--------|----------|----------|
+| Scalability | **Billion-scale distributed** | Millions (single-node focus) | Millions | Managed, billions |
+| Index types | HNSW, IVF, DiskANN, GPU | HNSW | HNSW | Proprietary |
+| Cloud-agnostic | **Yes (self-hosted)** | Yes | Yes | No (SaaS only) |
+| Batch import speed | **Very fast (bulk insert)** | Moderate | Moderate | API-limited |
+| Query latency (10M vectors) | **<5ms (HNSW)** | <5ms | ~10ms | <10ms |
+| Filtering support | **Attribute filtering + ANN** | Payload filtering | GraphQL | Metadata filtering |
+
+**Why Milvus:** Billion-scale distributed ANN is required for 1M+ items with dense embeddings. Self-hosted ensures cloud-agnosticism (no vendor lock-in like Pinecone). Supports both HNSW (low latency) and IVF_FLAT (high recall) index types. Qdrant was a close second but lacks the distributed scaling needed for production item catalogs exceeding 10M items.
+
+### 5. Stream Processing: Flink vs Alternatives
+
+| Criteria | **Apache Flink** | Spark Structured Streaming | Kafka Streams | Redpanda Transforms |
+|----------|-----------------|---------------------------|---------------|---------------------|
+| Processing model | **True event-at-a-time** | Micro-batch | Record-at-a-time | WASM functions |
+| Exactly-once | **Native** | Checkpoint-based | Yes | At-most-once |
+| Session windows | **Native support** | Limited | Custom | No |
+| State management | **RocksDB, queryable** | In-memory | RocksDB | Stateless |
+| Sliding windows | **Event-time, watermarks** | Processing-time only | Yes | No |
+| Throughput | Very high | High | High | Limited |
+
+**Why Flink:** True event-at-a-time processing with event-time semantics is critical for accurate real-time features (clicks_1h requires precise 1-hour sliding windows). Native session window support handles session event buffering without custom code. RocksDB state backend enables large state without OOM. Spark Structured Streaming was rejected because micro-batch introduces 100ms+ latency, which is too slow for real-time stock bitmap updates (<1s SLA).
+
+### 6. ML Training: PyTorch vs TensorFlow
+
+| Criteria | **PyTorch** | TensorFlow 2 | JAX |
+|----------|-----------|--------------|-----|
+| Research adoption | **~80% of papers** | ~15% | ~5% |
+| Debugging | **Eager mode, Python-native** | Graph mode complexity | Functional, less intuitive |
+| Distributed training | **DeepSpeed, FSDP** | MultiWorkerMirroredStrategy | pjit |
+| ONNX export | **Native torch.onnx** | tf2onnx (fragile) | Limited |
+| TorchRec (rec models) | **Native library** | No equivalent | No equivalent |
+| Production serving | ONNX → Triton | TF Serving | Triton (limited) |
+
+**Why PyTorch:** Dominant in research (~80% of new papers), meaning latest recommendation model architectures (Two-Tower, DCN-V2, DLRM) are published PyTorch-first. TorchRec provides production-grade recommendation primitives (embeddings, feature processing). ONNX export to Triton provides a clean training→serving boundary. TensorFlow was rejected due to declining research adoption and fragile ONNX conversion.
+
+### 7. Model Serving: Triton vs Alternatives
+
+| Criteria | **NVIDIA Triton** | TF Serving | TorchServe | BentoML |
+|----------|-------------------|------------|------------|---------|
+| Dynamic batching | **Yes (configurable)** | Limited | Yes | Yes |
+| INT8/FP16 quantization | **TensorRT native** | TFLite | Manual | Framework-dependent |
+| Multi-model serving | **Yes (model repository)** | Single model | Multiple | Multiple |
+| GPU utilization | **CUDA streams, MPS** | Moderate | Moderate | Framework-dependent |
+| Throughput (L4 GPU) | **~600 infer/s (INT8)** | ~200 infer/s | ~300 infer/s | ~250 infer/s |
+| gRPC + HTTP | **Both** | Both | Both | Both |
+
+**Why Triton:** Dynamic batching (32/64/128 preferred sizes) is critical for GPU utilization at low RPS — Tier 3 only receives ~4.5K RPS, so batching requests before GPU execution is essential. TensorRT INT8 quantization provides 3x throughput vs FP32 on L4 GPUs, reducing GPU count from 24 to 8. The model repository pattern supports A/B testing with multiple model versions side-by-side.
+
+### 8. API Gateway: Envoy vs Alternatives
+
+| Criteria | **Envoy** | NGINX | Kong | Traefik |
+|----------|----------|-------|------|---------|
+| Adaptive concurrency | **Yes (gradient-based)** | No | No | No |
+| Circuit breaking | **Per-endpoint, configurable** | Basic | Plugin | Basic |
+| gRPC proxying | **Native (HTTP/2)** | Limited | Plugin | Yes |
+| Observability | **Prometheus + Jaeger native** | Limited | Plugin | Prometheus |
+| Hot reload | **xDS API (zero downtime)** | Signal-based | Database | File watch |
+| Extensibility | **WASM filters** | Lua/njs | Lua plugins | Middleware |
+
+**Why Envoy:** Adaptive concurrency limiting automatically adjusts request limits based on backend latency — critical when DragonflyDB latency spikes trigger the degradation state machine. Per-endpoint circuit breaking means a Triton failure only affects Tier 3, not the entire API. Native gRPC support is needed for the Triton client. NGINX was rejected because it lacks adaptive concurrency and requires manual tuning of rate limits.
+
+### 9. Batch Processing: Spark vs Alternatives
+
+| Criteria | **Apache Spark** | Dask | Ray | Polars |
+|----------|-----------------|------|-----|--------|
+| Scale | **PB-scale, 1000+ nodes** | TB-scale | TB-scale | Single-node |
+| Ecosystem | **MLlib, Spark SQL, Delta** | NumPy-compatible | ML-focused | Fast DataFrame |
+| Spot instance support | **Native (dynamic alloc)** | Manual | Autoscaler | N/A |
+| Feature engineering | **Spark SQL + UDFs** | Pandas API | Custom | Fast but single-node |
+| Airflow integration | **SparkSubmitOperator** | DaskOperator | RayOperator | PythonOperator |
+
+**Why Spark:** PB-scale feature engineering over event logs is the primary use case. Spark SQL provides declarative aggregations (user/item features) that are easy to maintain. Dynamic resource allocation on spot instances reduces batch processing cost by ~60%. Polars is faster for single-node workloads but can't distribute across a cluster for our data volume.
+
+### 10. Monitoring & Observability
+
+| Criteria | **Prometheus + Grafana** | Datadog | New Relic | InfluxDB + Chronograf |
+|----------|------------------------|---------|-----------|----------------------|
+| Cost (50M DAU metrics) | **Free (self-hosted)** | $50K+/mo | $40K+/mo | Free (self-hosted) |
+| Kubernetes native | **ServiceMonitor CRDs** | Agent-based | Agent-based | Manual |
+| Alert manager | **Alertmanager (native)** | Built-in | Built-in | Kapacitor |
+| Custom metrics | **Client libraries (Go, Py)** | DogStatsD | Agent API | Line protocol |
+| Dashboards | **Grafana (best-in-class)** | Good | Good | Chronograf (limited) |
+| PromQL | **Native** | PromQL-compatible | NRQL | InfluxQL |
+
+**Why Prometheus + Grafana:** Zero licensing cost at scale — Datadog at 50M DAU would cost $50K+/mo for metrics alone. Kubernetes-native service discovery via ServiceMonitor CRDs. Grafana's dashboard ecosystem provides pre-built panels for DragonflyDB, Redpanda, and Flink. Alertmanager integrates with the degradation state machine for automated tier shedding.
 
 ---
 
@@ -345,6 +488,8 @@ Stock event -> Redpanda -> Flink -> DragonflyDB bitmap update (< 1 second)
 Query time:  GETBIT stock:bitmap {item_id}  ->  O(1), < 0.1ms
 ```
 
+Traditional approaches use database joins or API calls to check stock, adding 5-10ms per item. The bitmap approach reduces 100-item stock checks to a single O(1) GETBIT operation.
+
 ### 3. Graceful Degradation Chain
 
 ```
@@ -354,15 +499,17 @@ Critical(200%) ->  Tier 2 + 3 disabled (CPU shed)
 Emergency      ->  CDN static fallback only
 ```
 
+The system never shows an empty screen. Each degradation level sheds the most expensive tier first (GPU → CPU → cache), protecting the user experience at the cost of personalization quality.
+
 ### 4. Cost Optimization
 
-| Component | Before | After | Savings |
-|-----------|--------|-------|---------|
-| Message Broker | Kafka 50 nodes ($25K) | Redpanda 12 nodes ($6K) | -76% |
-| Cache | Redis 100 nodes ($30K) | DragonflyDB 10 nodes ($4.5K) | -85% |
-| GPU Inference | A100x20 ($60K) | L4 INT8x8 ($4.8K) | -92% |
-| Vector Search | Milvus 50 nodes ($20K) | Milvus 8 nodes ($3.2K) | -84% |
-| **Total infra** | **$285K/mo** | **$84K/mo** | **-71%** |
+| Component | Before (Conventional) | After (This Architecture) | Savings | Key Change |
+|-----------|----------------------|--------------------------|---------|------------|
+| Message Broker | Kafka 50 nodes ($25K) | Redpanda 12 nodes ($6K) | -76% | C++ thread-per-core, no JVM |
+| Cache | Redis 100 nodes ($30K) | DragonflyDB 10 nodes ($4.5K) | -85% | Multi-threaded, 5-8x/node |
+| GPU Inference | A100x20 ($60K) | L4 INT8x8 ($4.8K) | -92% | 3-Tier serving, 0.9% GPU traffic |
+| Vector Search | Milvus 50 nodes ($20K) | Milvus 8 nodes ($3.2K) | -84% | Pre-compute reduces ANN queries |
+| **Total infra** | **$285K/mo** | **$84K/mo** | **-71%** | |
 
 ---
 
