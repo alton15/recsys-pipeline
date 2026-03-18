@@ -1,0 +1,35 @@
+# TC-01: DragonflyDB Pod Kill — Failover < 3s
+#
+# Scenario:
+#   Kill the DragonflyDB pod to trigger failover.
+#   - Failover should complete within 3 seconds
+#   - Recommendation API should return fallback (popular items) during failover
+#   - After recovery, cache-based serving should resume
+#
+# Expected behavior:
+#   1. DragonflyDB pod is killed
+#   2. Recommendation API detects connection failure
+#   3. Circuit breaker opens, Tier 0 (popular items) fallback activates
+#   4. DragonflyDB pod restarts (managed by StatefulSet/Deployment)
+#   5. Circuit breaker closes, Tier 1 cache serving resumes
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: tc01-dragonfly-failover
+  namespace: recsys
+  labels:
+    app.kubernetes.io/part-of: recsys-pipeline
+    chaos-test: tc01
+  annotations:
+    chaos-mesh.org/description: "Kill DragonflyDB pod to test failover and fallback behavior"
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - recsys
+    labelSelectors:
+      app.kubernetes.io/name: dragonfly
+  gracePeriod: 0
+  duration: "30s"

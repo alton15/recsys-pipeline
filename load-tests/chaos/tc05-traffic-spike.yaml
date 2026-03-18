@@ -1,0 +1,45 @@
+# TC-05: 10x Traffic Spike — Graceful Degradation
+#
+# Scenario:
+#   Use StressChaos to simulate CPU/memory pressure from a 10x traffic spike.
+#   A companion k6 script should drive 10x normal request volume.
+#   - System should degrade gracefully (not crash)
+#   - Popular endpoint (Tier 0) should absorb overflow traffic
+#   - No OOMKill or pod restarts
+#
+# Expected behavior:
+#   1. 10x traffic is sent via k6 to recommendation-api
+#   2. CPU/memory pressure rises on recommendation-api pods
+#   3. Degradation state machine activates load shedding
+#   4. Tier 0 (CDN/popular) absorbs overflow requests
+#   5. No pods crash or OOMKill
+#   6. After traffic subsides, system returns to normal operation
+#
+# Note: This manifest applies CPU stress to recommendation-api to simulate
+# the effect of a traffic spike. Pair with k6 for realistic load generation.
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: tc05-traffic-spike
+  namespace: recsys
+  labels:
+    app.kubernetes.io/part-of: recsys-pipeline
+    chaos-test: tc05
+  annotations:
+    chaos-mesh.org/description: "Stress recommendation-api pods to simulate 10x traffic spike"
+spec:
+  mode: all
+  selector:
+    namespaces:
+      - recsys
+    labelSelectors:
+      app.kubernetes.io/name: recommendation-api
+  stressors:
+    cpu:
+      workers: 4
+      load: 80
+    memory:
+      workers: 2
+      size: "512MB"
+  duration: "180s"

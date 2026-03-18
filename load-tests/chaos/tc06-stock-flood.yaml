@@ -1,0 +1,45 @@
+# TC-06: Stock-out Event Flood — Bitmap Update SLA
+#
+# Scenario:
+#   Flood the event pipeline with 10K items/sec stock-out events.
+#   - Bitmap updates should complete within SLA (< 100ms per batch)
+#   - No events should be lost in the pipeline
+#   - Stream processor should handle backpressure gracefully
+#
+# Expected behavior:
+#   1. 10K stock-out events/sec injected into Redpanda
+#   2. Stream processor consumes events and updates stock:bitmap in DragonflyDB
+#   3. Bitmap updates complete within SLA
+#   4. Event collector handles produce backpressure via buffering
+#   5. After flood subsides, all events are verified processed (zero loss)
+#   6. Recommendation API correctly filters out-of-stock items
+#
+# Note: This manifest applies network bandwidth stress on the event-collector
+# to simulate the effect of a stock-out flood. Pair with a k6 or custom
+# script that sends 10K stock-out events/sec to the event-collector endpoint.
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: tc06-stock-flood
+  namespace: recsys
+  labels:
+    app.kubernetes.io/part-of: recsys-pipeline
+    chaos-test: tc06
+  annotations:
+    chaos-mesh.org/description: "Stress event-collector and stream-processor to simulate 10K/s stock-out flood"
+spec:
+  mode: all
+  selector:
+    namespaces:
+      - recsys
+    labelSelectors:
+      app.kubernetes.io/name: stream-processor
+  stressors:
+    cpu:
+      workers: 4
+      load: 90
+    memory:
+      workers: 2
+      size: "256MB"
+  duration: "120s"

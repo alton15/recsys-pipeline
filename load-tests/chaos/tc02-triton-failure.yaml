@@ -1,0 +1,36 @@
+# TC-02: Triton Pod Kill — Tier 1/2 Fallback Activation
+#
+# Scenario:
+#   Kill the Triton ranking service pod.
+#   - Tier 1/2 fallback should activate immediately
+#   - No 5xx errors should be returned to clients
+#   - Circuit breaker should open for ranking calls
+#
+# Expected behavior:
+#   1. Triton (ranking-service) pod is killed
+#   2. Recommendation API detects ranking service unavailability
+#   3. Circuit breaker opens for ranking calls
+#   4. API falls back to Tier 1 (cached top-K) or Tier 0 (popular items)
+#   5. Zero 5xx errors visible to clients
+#   6. After Triton recovers, circuit breaker half-opens and resumes ranking
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: tc02-triton-failure
+  namespace: recsys
+  labels:
+    app.kubernetes.io/part-of: recsys-pipeline
+    chaos-test: tc02
+  annotations:
+    chaos-mesh.org/description: "Kill Triton ranking service to verify fallback tiers and circuit breaker"
+spec:
+  action: pod-kill
+  mode: all
+  selector:
+    namespaces:
+      - recsys
+    labelSelectors:
+      app.kubernetes.io/name: ranking-service
+  gracePeriod: 0
+  duration: "60s"

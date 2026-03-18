@@ -1,0 +1,42 @@
+# TC-03: Redpanda Network Partition — Zero Event Loss
+#
+# Scenario:
+#   Partition one Redpanda broker from the rest of the cluster.
+#   - Verify zero event loss during and after partition
+#   - Event collector should handle backpressure gracefully
+#   - After partition heals, all buffered events should be processed
+#
+# Expected behavior:
+#   1. Network partition isolates one Redpanda broker
+#   2. Remaining brokers continue serving produce/consume requests
+#   3. Event collector handles produce errors with backpressure (retry + buffer)
+#   4. After partition heals, under-replicated partitions resync
+#   5. All events are eventually delivered — zero data loss
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: tc03-redpanda-partition
+  namespace: recsys
+  labels:
+    app.kubernetes.io/part-of: recsys-pipeline
+    chaos-test: tc03
+  annotations:
+    chaos-mesh.org/description: "Network partition on Redpanda broker to verify zero event loss"
+spec:
+  action: partition
+  mode: one
+  selector:
+    namespaces:
+      - recsys
+    labelSelectors:
+      app.kubernetes.io/name: redpanda
+  direction: both
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - recsys
+      labelSelectors:
+        app.kubernetes.io/name: redpanda
+  duration: "60s"

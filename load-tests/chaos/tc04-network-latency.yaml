@@ -1,0 +1,40 @@
+# TC-04: Network Latency Injection — Degradation State Machine
+#
+# Scenario:
+#   Inject 200ms latency on DragonflyDB network interface.
+#   - Degradation state machine should detect elevated latency
+#   - State should escalate from Normal -> Degraded -> Critical
+#   - Under Critical level, Tier 2/3 requests should be shed
+#
+# Expected behavior:
+#   1. 200ms latency injected on DragonflyDB pod
+#   2. Recommendation API observes cache latency spike
+#   3. Degradation state machine escalates to Degraded, then Critical
+#   4. Load shedding activates: Tier 2 (ANN retrieval) and Tier 3 requests are shed
+#   5. Tier 0 (popular items) continues serving without degradation
+#   6. After latency is removed, state machine recovers to Normal
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: tc04-network-latency
+  namespace: recsys
+  labels:
+    app.kubernetes.io/part-of: recsys-pipeline
+    chaos-test: tc04
+  annotations:
+    chaos-mesh.org/description: "Inject 200ms latency to DragonflyDB to test degradation state machine"
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - recsys
+    labelSelectors:
+      app.kubernetes.io/name: dragonfly
+  delay:
+    latency: "200ms"
+    correlation: "100"
+    jitter: "0ms"
+  direction: both
+  duration: "120s"
