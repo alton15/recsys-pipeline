@@ -13,6 +13,7 @@ type Router struct {
 	stock       StockChecker
 	reranker    Reranker
 	degradation DegradationChecker
+	ranker      Ranker
 }
 
 // NewRouter creates a Router. The reranker parameter may be nil if Tier 2
@@ -34,6 +35,21 @@ func NewRouterWithDegradation(store Store, stock StockChecker, reranker Reranker
 		reranker:    reranker,
 		degradation: dm,
 	}
+}
+
+// NewRouterWithRanker creates a Router with all tiers including Tier 3 inference.
+// The ranker parameter may be nil if Tier 3 is not available.
+func NewRouterWithRanker(store Store, stock StockChecker, reranker Reranker, dm *degradation.Manager, ranker Ranker) *Router {
+	r := &Router{
+		store:    store,
+		stock:    stock,
+		reranker: reranker,
+		ranker:   ranker,
+	}
+	if dm != nil {
+		r.degradation = dm
+	}
+	return r
 }
 
 // isTierAllowed checks whether the given tier is allowed. If no degradation
@@ -70,9 +86,10 @@ func (r *Router) Recommend(userID, sessionID string, limit int) ([]Recommendatio
 	}
 
 	level := Tier1
+	cacheMiss := len(recs) == 0
 
-	// Step 2: If no pre-computed recs, fall back to popular items.
-	if len(recs) == 0 {
+	// Step 2: If no pre-computed recs, fall back to popular items as candidates.
+	if cacheMiss {
 		recs, err = r.store.GetPopularItems(limit)
 		if err != nil {
 			return nil, "", err
@@ -97,7 +114,20 @@ func (r *Router) Recommend(userID, sessionID string, limit int) ([]Recommendatio
 		}
 	}
 
-	// Step 5: Truncate to the requested limit.
+	// Step 5: Tier 3 — model-based ranking via inference server.
+	// Only triggered on cache miss when ranker is available and tier3 is allowed.
+	if cacheMiss && r.ranker != nil && r.isTierAllowed("tier3") {
+		ranked, rankErr := r.ranker.Rank(userID, recs)
+		if rankErr != nil {
+			// On Tier 3 failure, keep current fallback candidates (graceful degradation).
+			level = Fallback
+		} else {
+			recs = ranked
+			level = Tier3
+		}
+	}
+
+	// Step 6: Truncate to the requested limit.
 	if len(recs) > limit {
 		recs = recs[:limit]
 	}

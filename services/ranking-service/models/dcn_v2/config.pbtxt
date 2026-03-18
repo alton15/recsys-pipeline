@@ -1,0 +1,18 @@
+name: "dcn_v2"
+platform: "onnxruntime_onnx"
+max_batch_size: 256
+input [
+  { name: "user_embedding" data_type: TYPE_FP32 dims: [128] },
+  { name: "item_embedding" data_type: TYPE_FP32 dims: [128] },
+  { name: "context_features" data_type: TYPE_FP32 dims: [32] }
+]
+output [
+  { name: "score" data_type: TYPE_FP32 dims: [1] }
+]
+dynamic_batching {
+  preferred_batch_size: [32, 64, 128]
+  max_queue_delay_microseconds: 5000
+}
+instance_group [
+  { count: 1 kind: KIND_CPU }
+]

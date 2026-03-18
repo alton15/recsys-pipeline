@@ -16,3 +16,9 @@ type StockChecker interface {
 type Reranker interface {
 	Rerank(userID string, sessionID string, items []Recommendation) ([]Recommendation, error)
 }
+
+// Ranker performs model-based scoring via an inference server (e.g., Triton).
+// It takes candidate items and returns them with updated relevance scores.
+type Ranker interface {
+	Rank(userID string, items []Recommendation) ([]Recommendation, error)
+}
