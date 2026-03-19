@@ -10,6 +10,12 @@
 *.out
 vendor/
 
+# Go build binaries
+services/event-collector/server
+services/recommendation-api/server
+services/traffic-simulator/seed
+services/traffic-simulator/simulate
+
 # ──────────────────────────────────────────────
 # Python
 # ──────────────────────────────────────────────
