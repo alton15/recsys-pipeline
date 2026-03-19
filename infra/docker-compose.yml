@@ -399,7 +399,7 @@ services:
       - "8080:8080"
       - "2112:2112"
     environment:
-      - REDPANDA_BROKERS=redpanda:9092
+      - REDPANDA_BROKERS=redpanda:29092
       - METRICS_PORT=2112
     depends_on:
       redpanda:

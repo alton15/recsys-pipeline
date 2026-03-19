@@ -47,8 +47,8 @@ func main() {
 
 	// Tier 3: Triton inference with circuit breaker protection.
 	tritonAddr := getEnv("TRITON_ADDR", "localhost:8001")
-	tritonClient := triton.NewClient(nil, triton.DefaultTimeout)
-	_ = tritonAddr // Used to establish the gRPC connection in production.
+	tritonGRPC := triton.NewGRPCClient(tritonAddr)
+	tritonClient := triton.NewClient(tritonGRPC, triton.DefaultTimeout)
 	tritonBreaker := circuitbreaker.New("triton", 5, 30*time.Second)
 	ranker := triton.NewProtectedRanker(tritonClient, tritonBreaker)
 
@@ -108,8 +108,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	appServer.Shutdown(ctx)
-	metricsServer.Shutdown(ctx)
+	if err := appServer.Shutdown(ctx); err != nil {
+		log.Printf("app server shutdown error: %v", err)
+	}
+	if err := metricsServer.Shutdown(ctx); err != nil {
+		log.Printf("metrics server shutdown error: %v", err)
+	}
 	log.Println("server stopped")
 }
 

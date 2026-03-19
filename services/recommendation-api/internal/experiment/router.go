@@ -1,6 +1,10 @@
 package experiment
 
-import "hash/fnv"
+import (
+	"hash/fnv"
+	"sync"
+	"time"
+)
 
 // Experiment represents an A/B test experiment configuration.
 type Experiment struct {
@@ -16,19 +20,30 @@ type Store interface {
 }
 
 // Router assigns users to experiments using consistent hashing.
+// Experiment configurations are cached and refreshed periodically to
+// avoid hitting DragonflyDB on every recommendation request.
 type Router struct {
-	store Store
+	store    Store
+	cacheTTL time.Duration
+
+	mu          sync.RWMutex
+	cached      []Experiment
+	lastFetched time.Time
 }
 
 // NewRouter creates a Router backed by the given experiment store.
+// Experiments are cached for 30 seconds by default.
 func NewRouter(store Store) *Router {
-	return &Router{store: store}
+	return &Router{
+		store:    store,
+		cacheTTL: 30 * time.Second,
+	}
 }
 
 // GetExperiment determines which experiment (if any) the user is assigned to.
 // Returns nil, nil when the user falls into the control group (no experiment).
 func (r *Router) GetExperiment(userID string) (*Experiment, error) {
-	experiments, err := r.store.ListActiveExperiments()
+	experiments, err := r.loadExperiments()
 	if err != nil {
 		return nil, err
 	}
@@ -46,6 +61,39 @@ func (r *Router) GetExperiment(userID string) (*Experiment, error) {
 	}
 
 	return nil, nil // control group
+}
+
+// loadExperiments returns cached experiments if still fresh, otherwise
+// fetches from the store and updates the cache.
+func (r *Router) loadExperiments() ([]Experiment, error) {
+	r.mu.RLock()
+	if r.cached != nil && time.Since(r.lastFetched) < r.cacheTTL {
+		experiments := r.cached
+		r.mu.RUnlock()
+		return experiments, nil
+	}
+	r.mu.RUnlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Double-check: another goroutine may have refreshed while we waited.
+	if r.cached != nil && time.Since(r.lastFetched) < r.cacheTTL {
+		return r.cached, nil
+	}
+
+	experiments, err := r.store.ListActiveExperiments()
+	if err != nil {
+		// On error, return stale cache if available.
+		if r.cached != nil {
+			return r.cached, nil
+		}
+		return nil, err
+	}
+
+	r.cached = experiments
+	r.lastFetched = time.Now()
+	return experiments, nil
 }
 
 // hashBucket maps a user ID to a bucket in [0, 100) using FNV-1a.

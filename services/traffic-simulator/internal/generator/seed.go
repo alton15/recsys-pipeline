@@ -107,13 +107,30 @@ func seedUserRecommendations(ctx context.Context, client *redis.Client, users []
 	return nil
 }
 
-// generateUserRecs builds 100 recommendations for a user, preferring items
-// that match the user's category preferences.
+// generateUserRecs builds up to topKCount recommendations for a user, preferring
+// items that match the user's category preferences. When preferred categories
+// don't provide enough candidates, items from other categories are added to
+// fill the remaining slots.
 func generateUserRecs(user User, catItems map[string][]Item) []Recommendation {
 	// Collect candidate items from preferred categories.
+	prefSet := make(map[string]struct{}, len(user.CategoryPrefs))
 	var candidates []Item
 	for _, cat := range user.CategoryPrefs {
+		prefSet[cat] = struct{}{}
 		candidates = append(candidates, catItems[cat]...)
+	}
+
+	// If preferred categories don't provide enough, supplement from other categories.
+	if len(candidates) < topKCount {
+		for cat, items := range catItems {
+			if _, preferred := prefSet[cat]; preferred {
+				continue
+			}
+			candidates = append(candidates, items...)
+			if len(candidates) >= topKCount {
+				break
+			}
+		}
 	}
 
 	// Shuffle and deduplicate (categories might overlap in theory, but IDs are unique per category).

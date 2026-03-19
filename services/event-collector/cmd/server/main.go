@@ -70,8 +70,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	appServer.Shutdown(ctx)
-	metricsServer.Shutdown(ctx)
+	if err := appServer.Shutdown(ctx); err != nil {
+		log.Printf("app server shutdown error: %v", err)
+	}
+	if err := metricsServer.Shutdown(ctx); err != nil {
+		log.Printf("metrics server shutdown error: %v", err)
+	}
 	log.Println("server stopped")
 }
 

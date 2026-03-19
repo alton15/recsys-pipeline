@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/recsys-pipeline/shared/event"
@@ -12,8 +14,9 @@ import (
 
 // RedpandaProducer publishes events to a Redpanda topic using franz-go.
 type RedpandaProducer struct {
-	client *kgo.Client
-	topic  string
+	client      *kgo.Client
+	topic       string
+	produceErrs atomic.Int64
 }
 
 // NewRedpanda creates a new RedpandaProducer connected to the given brokers.
@@ -49,12 +52,17 @@ func (p *RedpandaProducer) Publish(e event.Event) error {
 
 	p.client.Produce(context.Background(), record, func(_ *kgo.Record, err error) {
 		if err != nil {
-			// In production, this would feed into a dead-letter queue or metrics.
-			fmt.Printf("produce error for user %s: %v\n", e.UserID, err)
+			count := p.produceErrs.Add(1)
+			log.Printf("produce error for user %s (total_errors=%d): %v", e.UserID, count, err)
 		}
 	})
 
 	return nil
+}
+
+// ProduceErrors returns the total number of async produce errors since startup.
+func (p *RedpandaProducer) ProduceErrors() int64 {
+	return p.produceErrs.Load()
 }
 
 // Close flushes pending records and closes the client.
