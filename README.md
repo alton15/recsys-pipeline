@@ -8,6 +8,32 @@ A cloud-agnostic reference architecture that runs locally with `docker-compose u
 
 ---
 
+## Table of Contents
+
+- [What This Project Does](#what-this-project-does)
+- [Why This Project?](#why-this-project)
+- [Architecture](#architecture)
+- [Component Architecture](#component-architecture)
+  - [Envoy Gateway](#envoy-gateway--traffic-gate) · [Event Collector](#event-collector--event-ingestion) · [Redpanda](#redpanda--event-streaming-backbone) · [Stream Processor](#stream-processor--real-time-feature-engine-apache-flink) · [DragonflyDB](#dragonflydb--unified-feature-store) · [Milvus](#milvus--vector-similarity-search) · [Recommendation API](#recommendation-api--the-orchestrator) · [Ranking Service / Triton](#ranking-service--triton--gpu-inference) · [Batch Processor](#batch-processor--offline-intelligence-pyspark--airflow) · [PostgreSQL](#postgresql--metadata-store) · [MinIO](#minio--object-storage) · [Monitoring Stack](#monitoring-stack--observability-layer)
+  - [End-to-End Data Flow](#end-to-end-data-flow)
+- [3-Tier Serving Strategy](#3-tier-serving-strategy)
+- [Project Structure](#project-structure)
+- [Tech Stack](#tech-stack)
+- [Architecture Decisions](#architecture-decisions)
+- [Tech Stack Selection Rationale](#tech-stack-selection-rationale)
+- [Key Design Decisions](#key-design-decisions)
+- [Architectural Considerations](#architectural-considerations)
+  - [CDN for API Responses](#1-cdn-for-api-responses-not-just-static-files) · [Timeout Budget](#2-timeout-budget-strategy) · [Connection Pools](#3-connection-pool-sizing) · [Partition Keys](#4-partition-key-strategy) · [Failure Modes](#5-failure-mode-analysis) · [Consistency Model](#6-data-consistency-model) · [Cold Start](#7-cold-start-handling) · [Cache Invalidation](#8-cache-invalidation-strategy) · [Backpressure](#9-backpressure-handling) · [Memory Budget](#10-memory-budget-calculation) · [Idempotency](#11-ordering--idempotency-guarantees) · [Security](#12-security-considerations) · [Graceful Shutdown](#13-graceful-shutdown--zero-downtime-deploys) · [Observability-Driven Degradation](#14-observability-driven-degradation)
+- [Recommendation Strategy Deep Dive](#recommendation-strategy-deep-dive)
+- [Data Architecture & Performance Considerations](#data-architecture--performance-considerations)
+- [Quick Start](#quick-start)
+- [Performance Verification Results](#performance-verification-results)
+- [Production Deployment](#production-deployment)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+---
+
 ## What This Project Does
 
 This is a **personalized product recommendation system** for large-scale e-commerce. When a user opens the app, this system decides which products to show — tailored to their browsing history, purchase patterns, and real-time session behavior.
@@ -276,37 +302,17 @@ stateDiagram-v2
     Critical --> Emergency : Load >= 300% OR DragonflyDB down
     Emergency --> Critical : Services recovered
 
-    state Normal {
-        [*] : All tiers active
-        note right of Normal
-            Tier 0 + 1 + 2 + 3
-            Full personalization
-        end note
-    }
+    Normal : All tiers active (Tier 0+1+2+3)
+    Normal : Full personalization
 
-    state Warning {
-        [*] : Tier 3 disabled
-        note right of Warning
-            GPU inference shed
-            Tier 0 + 1 + 2 only
-        end note
-    }
+    Warning : Tier 3 disabled
+    Warning : GPU inference shed (Tier 0+1+2 only)
 
-    state Critical {
-        [*] : Tier 2 + 3 disabled
-        note right of Critical
-            CPU re-ranking shed
-            Tier 0 + 1 only (cache)
-        end note
-    }
+    Critical : Tier 2+3 disabled
+    Critical : CPU re-ranking shed (Tier 0+1 only)
 
-    state Emergency {
-        [*] : CDN static fallback
-        note right of Emergency
-            All backend tiers shed
-            Serve cached popular lists
-        end note
-    }
+    Emergency : CDN static fallback
+    Emergency : All backend tiers shed
 ```
 
 ### 5. Deployment Architecture (Kubernetes)

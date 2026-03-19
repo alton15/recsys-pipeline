@@ -8,6 +8,32 @@
 
 ---
 
+## 목차
+
+- [이 프로젝트가 하는 일](#이-프로젝트가-하는-일)
+- [왜 이 프로젝트인가?](#왜-이-프로젝트인가)
+- [아키텍처](#아키텍처)
+- [컴포넌트 아키텍처](#컴포넌트-아키텍처)
+  - [Envoy Gateway](#envoy-gateway--트래픽-게이트) · [Event Collector](#event-collector--이벤트-수집) · [Redpanda](#redpanda--이벤트-스트리밍-백본) · [Stream Processor](#stream-processor--실시간-피처-엔진-apache-flink) · [DragonflyDB](#dragonflydb--통합-피처-스토어) · [Milvus](#milvus--벡터-유사도-검색) · [Recommendation API](#recommendation-api--오케스트레이터) · [Ranking Service / Triton](#ranking-service--triton--gpu-추론) · [Batch Processor](#batch-processor--오프라인-인텔리전스-pyspark--airflow) · [PostgreSQL](#postgresql--메타데이터-저장소) · [MinIO](#minio--오브젝트-스토리지) · [모니터링 스택](#모니터링-스택--관측성-레이어)
+  - [전체 데이터 흐름](#전체-데이터-흐름-end-to-end)
+- [3-Tier 서빙 전략](#3-tier-서빙-전략)
+- [프로젝트 구조](#프로젝트-구조)
+- [기술 스택](#기술-스택)
+- [아키텍처 의사결정](#아키텍처-의사결정)
+- [기술 스택 선정 근거](#기술-스택-선정-근거)
+- [핵심 설계 결정](#핵심-설계-결정)
+- [아키텍처 고려사항](#아키텍처-고려사항)
+  - [CDN API 응답 캐싱](#1-cdn은-정적-파일-전용이-아니다--api-응답-캐싱) · [타임아웃 예산](#2-타임아웃-예산-전략) · [커넥션 풀](#3-커넥션-풀-사이징) · [파티션 키](#4-파티션-키-전략) · [장애 모드](#5-장애-모드-분석) · [일관성 모델](#6-데이터-일관성-모델) · [콜드 스타트](#7-콜드-스타트-처리) · [캐시 무효화](#8-캐시-무효화-전략) · [백프레셔](#9-백프레셔-처리) · [메모리 예산](#10-메모리-예산-계산) · [멱등성](#11-순서-보장--멱등성) · [보안](#12-보안-고려사항) · [정상 종료](#13-정상-종료--무중단-배포) · [관측성 기반 Degradation](#14-관측성-기반-degradation)
+- [추천 전략 상세 분석](#추천-전략-상세-분석)
+- [데이터 아키텍처 & 성능 고려사항](#데이터-아키텍처--성능-고려사항)
+- [빠른 시작](#빠른-시작)
+- [성능 검증 결과](#성능-검증-결과)
+- [프로덕션 배포](#프로덕션-배포)
+- [로드맵](#로드맵)
+- [라이선스](#라이선스)
+
+---
+
 ## 이 프로젝트가 하는 일
 
 대규모 이커머스를 위한 **개인화 상품 추천 시스템**입니다. 유저가 앱을 열면, 이 시스템이 유저의 탐색 이력, 구매 패턴, 실시간 세션 행동을 기반으로 어떤 상품을 보여줄지 결정합니다.
@@ -276,21 +302,17 @@ stateDiagram-v2
     Critical --> Emergency : 부하 >= 300% 또는 DragonflyDB 장애
     Emergency --> Critical : 서비스 복구
 
-    state Normal {
-        [*] : 모든 Tier 활성
-    }
+    Normal : 모든 Tier 활성 (Tier 0+1+2+3)
+    Normal : 완전한 개인화
 
-    state Warning {
-        [*] : Tier 3 비활성 (GPU 차단)
-    }
+    Warning : Tier 3 비활성
+    Warning : GPU 추론 차단 (Tier 0+1+2만)
 
-    state Critical {
-        [*] : Tier 2 + 3 비활성 (CPU 차단)
-    }
+    Critical : Tier 2+3 비활성
+    Critical : CPU 재랭킹 차단 (Tier 0+1만)
 
-    state Emergency {
-        [*] : CDN 정적 폴백만 제공
-    }
+    Emergency : CDN 정적 폴백
+    Emergency : 모든 백엔드 Tier 차단
 ```
 
 ### 5. 배포 아키텍처 (Kubernetes)
