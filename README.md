@@ -513,6 +513,298 @@ The system never shows an empty screen. Each degradation level sheds the most ex
 
 ---
 
+## Recommendation Strategy Deep Dive
+
+### How Recommendations Are Served
+
+The recommendation-api implements a **4-stage cascade** where each stage has a strict latency budget. The system always returns results — even under total backend failure — by falling through to the next tier.
+
+```
+Request → Tier 1 (Cache) → Tier 2 (Session Rerank) → Tier 3 (Model Inference) → Fallback (Popular)
+```
+
+### Tier 1: Pre-computed Recommendations (3-5ms)
+
+The batch pipeline pre-computes per-user top-100 recommendations offline and stores them in DragonflyDB:
+
+```
+Key:    rec:{user_id}:top_k
+Value:  [{"item_id":"i_000042","score":0.97}, {"item_id":"i_000108","score":0.95}, ...]
+TTL:    7 days (refreshed by batch pipeline)
+```
+
+- Users are assigned 3-10 category preferences during profile creation
+- Items from preferred categories are scored by `(100 - rank) / 100`, giving a 1.0 → 0.01 distribution
+- A single `GET` operation retrieves the full recommendation list — **1 round trip, O(1)**
+- Target cache hit rate: **85%** of traffic served from this tier
+
+**Tradeoff:** Pre-computed results are stale by definition. A user who clicks 50 items in electronics and then switches to fashion won't see updated recommendations until the next batch run (planned: 4-hour incremental).
+
+### Tier 2: Session-Aware Re-ranking (10-20ms)
+
+When a `session_id` is provided, the system reads recent session events and adjusts scores to avoid showing items the user has already seen:
+
+```
+Key:    session:{session_id}:events
+Type:   ZSET (sorted set, scored by Unix timestamp)
+Read:   ZREVRANGE 0 49  →  last 50 events
+```
+
+**Scoring adjustments:**
+
+| Condition | Weight | Effect |
+|-----------|--------|--------|
+| Base score | ×1.0 | Original pre-computed score |
+| Already clicked | −0.5 | Strongly penalize re-shown clicks |
+| Already viewed | −0.2 | Mildly penalize re-shown views |
+
+The scorer creates a new slice (immutable pattern), sorts by adjusted score, and returns without modifying the original data.
+
+**Tradeoff:** Re-ranking only demotes — it cannot promote items the user hasn't seen before. True exploration requires Tier 3 inference.
+
+### Tier 3: GPU Model Inference (80ms SLA)
+
+For cache-miss users (new/cold-start), the system calls NVIDIA Triton Inference Server:
+
+```
+Model:    DCN-V2 (Deep & Cross Network v2)
+Input:    UserEmbedding[128] + ItemEmbedding[128] + ContextFeatures[32]
+Output:   Relevance scores per item
+Timeout:  80ms (enforced via context deadline)
+```
+
+- Protected by a **circuit breaker**: opens after 5 consecutive failures, resets after 30 seconds
+- On Triton failure: the system keeps whatever Tier 1/2 produced (graceful degradation)
+- In production, user/item embeddings would be fetched from the feature store; currently uses placeholder zero vectors
+
+**Tradeoff:** GPU inference is expensive ($4.8K/mo for 8 L4 GPUs). The 3-tier strategy ensures only ~0.9% of traffic reaches this tier.
+
+### Fallback: Popular Items
+
+When all personalized tiers fail:
+
+```
+Key:    rec:popular:top_k
+Value:  Global top-100 items by popularity (computed at seed time)
+Cache:  Cache-Control: public, max-age=30, stale-while-revalidate=60
+```
+
+No personalization. Every user sees the same list. This is the "never show an empty screen" guarantee.
+
+### Complete Request Flow
+
+```
+GET /api/v1/recommend?user_id=u_00001&session_id=sess_123&limit=20
+│
+├── 1. Degradation check: is tier1 allowed?
+│   └── If Emergency level → return popular items immediately
+│
+├── 2. Tier 1: GET rec:u_00001:top_k from DragonflyDB
+│   ├── Cache HIT  → recs = cached items, level = "tier1_precomputed"
+│   └── Cache MISS → recs = popular items, level = "fallback_popular"
+│
+├── 3. Stock filter: 2-pipeline DragonflyDB batch
+│   ├── Pipeline 1: GET stock:id_map:{item_id} × N items → offsets
+│   ├── Pipeline 2: GETBIT stock:bitmap {offset} × N items → in-stock?
+│   └── Remove out-of-stock items (fail-open: unknown = in-stock)
+│
+├── 4. Tier 2: If session_id provided AND tier2 allowed
+│   ├── ZREVRANGE session:sess_123:events 0 49 → last 50 events
+│   ├── Build clicked/viewed item sets
+│   ├── Apply weighted scoring penalties
+│   └── Re-sort by adjusted scores → level = "tier2_rerank"
+│
+├── 5. Tier 3: If cache miss AND ranker available AND tier3 allowed
+│   ├── Circuit breaker check → if open, skip
+│   ├── Build batch inference request (128D embeddings)
+│   ├── Call Triton gRPC with 80ms timeout
+│   ├── On success → level = "tier3_inference"
+│   └── On failure → record failure, keep fallback results
+│
+├── 6. Truncate to limit (default 20, max 100)
+│
+├── 7. A/B experiment assignment (non-blocking)
+│   ├── SMEMBERS experiment:active → active experiment IDs
+│   ├── FNV-1a hash(user_id) % 100 → bucket [0-99]
+│   └── Cumulative traffic% matching → experiment_id + model_version
+│
+└── 8. Return JSON response
+    {
+      "items": [...],
+      "tier": "tier2_rerank",
+      "experiment_id": "exp_v2",
+      "model_version": "dcn_v2_20240315"
+    }
+```
+
+### What's Not Yet Implemented
+
+| Feature | Status | Impact |
+|---------|--------|--------|
+| Real-time feature pipeline (Flink → DragonflyDB) | Key patterns defined, pipeline not built | No clicks_1h, views_1d, ctr_7d features for scoring |
+| 4-hour incremental pre-compute (Spark) | Planned | Recommendations stale up to 7 days |
+| Item catalog in PostgreSQL | Schema not created | No complex filtering (price range, category, etc.) |
+| User/item embedding fetch from feature store | Placeholder zero vectors | Tier 3 scoring not meaningful |
+| Session event TTL/cleanup | No TTL set | Memory leak on long-running sessions |
+
+---
+
+## Data Architecture & Performance Considerations
+
+### DragonflyDB Key Schema
+
+DragonflyDB is the **sole data store** for the real-time serving path. PostgreSQL is only used by Airflow for batch orchestration metadata.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  RECOMMENDATIONS                                                 │
+│  rec:{user_id}:top_k     STRING(JSON)  100 items   TTL: 7 days │
+│  rec:popular:top_k        STRING(JSON)  100 items   TTL: none   │
+├─────────────────────────────────────────────────────────────────┤
+│  FEATURES (defined, not yet populated)                           │
+│  feat:user:{uid}:clicks_1h    INT       1h window   TTL: 2h    │
+│  feat:user:{uid}:views_1d     INT       1d window   TTL: 2d    │
+│  feat:user:{uid}:recent_items LIST      last 50     TTL: 7d    │
+│  feat:item:{iid}:ctr_7d       FLOAT     7d CTR      TTL: 8d    │
+│  feat:item:{iid}:popularity   FLOAT     score       TTL: 1d    │
+├─────────────────────────────────────────────────────────────────┤
+│  STOCK                                                           │
+│  stock:bitmap               BITMAP     1M bits      TTL: none   │
+│  stock:id_map:{item_id}     STRING     bit offset   TTL: none   │
+│  stock:next_bit_pos         INT        counter      TTL: none   │
+├─────────────────────────────────────────────────────────────────┤
+│  SESSION                                                         │
+│  session:{sid}:events       ZSET       JSON members  TTL: none  │
+├─────────────────────────────────────────────────────────────────┤
+│  EXPERIMENTS                                                     │
+│  experiment:active          SET        experiment IDs TTL: none  │
+│  experiment:{exp_id}        STRING(JSON) config       TTL: none  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Performance Bottlenecks & Tradeoffs
+
+#### 1. Stock Filtering: 2-Pipeline Pattern
+
+```
+Pipeline 1: GET stock:id_map:{item_id} × 100 items  →  100 string lookups
+Pipeline 2: GETBIT stock:bitmap {offset}  × 100 items  →  100 bit reads
+Total: 2 DragonflyDB round trips per request
+```
+
+| Approach | Round Trips | Latency | Tradeoff |
+|----------|-------------|---------|----------|
+| Current (2-pipeline) | 2 | ~2-5ms | Clean separation, but 2 trips |
+| Pre-embed offsets in recs | 1 | ~1-2ms | Faster, but larger stored objects |
+| Bloom filter client-side | 0 | ~0.1ms | Fastest, but false positives |
+
+**Current choice:** 2-pipeline is acceptable at <5ms. If stock checks become a bottleneck, pre-embedding offsets in recommendation objects eliminates one round trip.
+
+#### 2. JSON Serialization Overhead
+
+All recommendations are stored as JSON strings in DragonflyDB. Every read requires `json.Unmarshal` of 100-item arrays.
+
+| Format | Unmarshal 100 items | Size | Tradeoff |
+|--------|-------------------|------|----------|
+| JSON | ~0.5ms | ~4KB | Human-readable, standard |
+| MessagePack | ~0.2ms | ~2.5KB | 2x faster, 40% smaller |
+| Protobuf | ~0.15ms | ~2KB | 3x faster, needs schema |
+| Pre-parsed (Go structs via gob) | ~0.05ms | ~3KB | Fastest, Go-only |
+
+**Current choice:** JSON for simplicity and debuggability. At 1K+ RPS per instance, the ~0.5ms overhead is not the bottleneck (DragonflyDB network latency dominates). Worth revisiting at 5K+ RPS per instance.
+
+#### 3. Session Event Accumulation (No TTL)
+
+Session events are stored in ZSETs without TTL or size limits:
+
+```
+session:{session_id}:events  →  ZSET with unlimited members
+```
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Long sessions (>1000 events) | Memory bloat, slow ZREVRANGE | Add ZREMRANGEBYSCORE for events >24h |
+| Abandoned sessions | Orphaned keys consume memory | Set TTL (e.g., 24h) on session keys |
+| Hot sessions (power users) | Large ZSET scans | Cap at 200 events with ZREMRANGEBYRANK |
+
+**Recommendation:** Add `EXPIRE session:{sid}:events 86400` (24h TTL) on first write, and `ZREMRANGEBYRANK session:{sid}:events 0 -201` to cap at 200 events.
+
+#### 4. DragonflyDB Connection & Timeout Tuning
+
+Current configuration creates **3 separate client pools**:
+
+```go
+// Store client (recommendations)     → PoolSize: 100, Timeout: 10ms
+// Reranker client (session events)   → PoolSize: 100, Timeout: 10ms
+// Stock client (bitmap operations)   → PoolSize: 100, Timeout: default
+// Total: 300 connections per instance
+```
+
+| Issue | Evidence | Recommendation |
+|-------|----------|----------------|
+| 10ms timeout too aggressive | Benchmark showed experiment routing timeouts under load | Increase to 50-100ms for non-critical paths |
+| 300 connections per instance | At 250 instances = 75K connections to DragonflyDB | Use connection multiplexing or reduce pool sizes |
+| No read replicas | All reads hit primary | Add read replicas for recommendation/popular reads |
+
+#### 5. Pre-computed Recommendations Staleness
+
+```
+Batch compute → DragonflyDB SET (TTL: 7 days) → User request reads cached result
+                    ↑                                          ↓
+              Refresh cycle: ?                     Stale data served until next refresh
+```
+
+| Refresh Strategy | Freshness | Cost | Complexity |
+|-----------------|-----------|------|------------|
+| Current (seed only) | 7 days max staleness | Zero ongoing cost | Lowest |
+| Daily full recompute | 24h max staleness | High (full Spark job) | Medium |
+| 4h incremental | 4h max staleness | Medium (incremental) | Medium |
+| Near-real-time (Flink) | Minutes | High (continuous compute) | Highest |
+
+**Planned approach:** 4-hour incremental recompute via Spark, triggered by Airflow DAG. This balances freshness with cost — full recompute runs daily at off-peak, incremental runs every 4 hours.
+
+#### 6. Missing PostgreSQL Integration
+
+The architecture diagram shows PostgreSQL for item catalog and user metadata, but the serving path **exclusively uses DragonflyDB**:
+
+```
+Current:   recommendation-api → DragonflyDB only
+Planned:   recommendation-api → DragonflyDB (hot path)
+                               → PostgreSQL (cold path: catalog queries, admin)
+```
+
+| Capability | DragonflyDB | PostgreSQL | Gap |
+|------------|-------------|------------|-----|
+| Get user's top-K recs | Yes (STRING) | Not needed | — |
+| Filter by price range | Not supported | WHERE price BETWEEN | **Gap** |
+| Filter by category | Not supported | WHERE category_id = | **Gap** |
+| Item metadata (name, image, etc.) | Not stored | Full catalog | **Gap** |
+| Complex analytics queries | No SQL | Full SQL | **Gap** |
+
+**Recommendation:** Use PostgreSQL as the source of truth for item catalog. Sync to DragonflyDB via CDC (Change Data Capture) or batch ETL. The recommendation-api should enrich results with item metadata from a denormalized DragonflyDB cache, not query PostgreSQL on the hot path.
+
+#### 7. Scaling Decision Tree
+
+```
+                        ┌─ Latency high?
+                        │   ├─ p50 > 20ms → Check DragonflyDB connection pool saturation
+                        │   ├─ p95 > 100ms → Check stock filter pipeline (2 round trips)
+                        │   └─ p99 > 200ms → Check Tier 3 circuit breaker (Triton timeout)
+                        │
+Current RPS ──────────── ├─ Error rate high?
+  (~1K/instance)        │   ├─ 5xx errors → Check DragonflyDB connectivity / pool exhaustion
+                        │   ├─ Timeout errors → Increase read timeout (10ms → 50ms)
+                        │   └─ Circuit open → Triton unhealthy, verify GPU health
+                        │
+                        └─ Need more throughput?
+                            ├─ < 5K RPS → Add instances (horizontal scale)
+                            ├─ < 50K RPS → Add DragonflyDB read replicas
+                            ├─ < 200K RPS → Shard DragonflyDB by user_id hash
+                            └─ > 200K RPS → Add CDN layer (Tier 0) for popular items
+```
+
+---
+
 ## Quick Start
 
 ### Prerequisites

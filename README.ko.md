@@ -497,6 +497,298 @@ Emergency      ->  CDN 정적 폴백만
 
 ---
 
+## 추천 전략 상세 분석
+
+### 추천이 제공되는 방식
+
+recommendation-api는 **4단계 캐스케이드** 방식을 구현합니다. 각 단계에 엄격한 레이턴시 예산이 있으며, 전체 백엔드 장애 시에도 항상 결과를 반환합니다.
+
+```
+요청 → Tier 1 (캐시) → Tier 2 (세션 리랭킹) → Tier 3 (모델 추론) → Fallback (인기 상품)
+```
+
+### Tier 1: 사전 계산된 추천 (3-5ms)
+
+배치 파이프라인이 오프라인에서 유저별 Top-100 추천을 사전 계산하여 DragonflyDB에 저장합니다:
+
+```
+Key:    rec:{user_id}:top_k
+Value:  [{"item_id":"i_000042","score":0.97}, {"item_id":"i_000108","score":0.95}, ...]
+TTL:    7일 (배치 파이프라인이 갱신)
+```
+
+- 유저 프로필 생성 시 3-10개 카테고리 선호도 할당
+- 선호 카테고리의 아이템에 `(100 - rank) / 100` 점수 부여 (1.0 → 0.01 분포)
+- 단일 `GET` 연산으로 전체 추천 목록 조회 — **1 round trip, O(1)**
+- 목표 캐시 히트율: 트래픽의 **85%**
+
+**트레이드오프:** 사전 계산된 결과는 본질적으로 stale합니다. 전자제품을 50개 클릭한 후 패션으로 전환한 유저는 다음 배치 실행(계획: 4시간 증분)까지 업데이트된 추천을 볼 수 없습니다.
+
+### Tier 2: 세션 기반 재랭킹 (10-20ms)
+
+`session_id`가 제공되면 최근 세션 이벤트를 읽어 이미 본 아이템의 점수를 조정합니다:
+
+```
+Key:    session:{session_id}:events
+Type:   ZSET (정렬 셋, Unix 타임스탬프로 정렬)
+Read:   ZREVRANGE 0 49  →  최근 50개 이벤트
+```
+
+**점수 조정:**
+
+| 조건 | 가중치 | 효과 |
+|------|--------|------|
+| 기본 점수 | ×1.0 | 원래 사전 계산 점수 |
+| 이미 클릭 | −0.5 | 재표시된 클릭 아이템 강하게 감점 |
+| 이미 조회 | −0.2 | 재표시된 조회 아이템 약하게 감점 |
+
+스코어러는 새로운 슬라이스를 생성하고(불변 패턴), 조정된 점수로 정렬하여 원본 데이터를 수정하지 않고 반환합니다.
+
+**트레이드오프:** 재랭킹은 감점만 가능합니다 — 유저가 보지 않은 새 아이템을 승격시킬 수 없습니다. 진정한 탐색(exploration)을 위해서는 Tier 3 추론이 필요합니다.
+
+### Tier 3: GPU 모델 추론 (80ms SLA)
+
+캐시 미스 유저(신규/콜드 스타트)의 경우 NVIDIA Triton Inference Server를 호출합니다:
+
+```
+모델:    DCN-V2 (Deep & Cross Network v2)
+입력:    UserEmbedding[128] + ItemEmbedding[128] + ContextFeatures[32]
+출력:    아이템별 관련도 점수
+타임아웃: 80ms (context deadline으로 강제)
+```
+
+- **Circuit breaker**로 보호: 연속 5회 실패 시 열림, 30초 후 리셋
+- Triton 장애 시: Tier 1/2 결과를 유지 (graceful degradation)
+- 프로덕션에서는 feature store에서 유저/아이템 임베딩을 조회; 현재는 placeholder 제로 벡터 사용
+
+**트레이드오프:** GPU 추론은 비용이 높습니다 (L4 GPU 8대 = $4.8K/월). 3-Tier 전략으로 전체 트래픽의 ~0.9%만 이 티어에 도달합니다.
+
+### Fallback: 인기 상품
+
+모든 개인화 티어가 실패하면:
+
+```
+Key:    rec:popular:top_k
+Value:  전체 인기 상품 Top-100 (시드 시점에 계산)
+Cache:  Cache-Control: public, max-age=30, stale-while-revalidate=60
+```
+
+개인화 없음. 모든 유저에게 동일한 목록 제공. "빈 화면 절대 보여주지 않기" 보장입니다.
+
+### 전체 요청 흐름
+
+```
+GET /api/v1/recommend?user_id=u_00001&session_id=sess_123&limit=20
+│
+├── 1. Degradation 체크: tier1이 허용되는가?
+│   └── Emergency 레벨이면 → 즉시 인기 상품 반환
+│
+├── 2. Tier 1: DragonflyDB에서 GET rec:u_00001:top_k
+│   ├── 캐시 HIT  → recs = 캐시 아이템, level = "tier1_precomputed"
+│   └── 캐시 MISS → recs = 인기 상품, level = "fallback_popular"
+│
+├── 3. 재고 필터: DragonflyDB 2-pipeline 배치
+│   ├── Pipeline 1: GET stock:id_map:{item_id} × N개 → 오프셋 조회
+│   ├── Pipeline 2: GETBIT stock:bitmap {offset} × N개 → 재고 확인
+│   └── 품절 아이템 제거 (fail-open: 알 수 없음 = 재고 있음으로 처리)
+│
+├── 4. Tier 2: session_id 존재 AND tier2 허용 시
+│   ├── ZREVRANGE session:sess_123:events 0 49 → 최근 50개 이벤트
+│   ├── 클릭/조회 아이템 셋 구성
+│   ├── 가중치 점수 감점 적용
+│   └── 조정된 점수로 재정렬 → level = "tier2_rerank"
+│
+├── 5. Tier 3: 캐시 미스 AND ranker 가용 AND tier3 허용 시
+│   ├── Circuit breaker 확인 → open이면 스킵
+│   ├── 배치 추론 요청 구성 (128D 임베딩)
+│   ├── Triton gRPC 호출 (80ms 타임아웃)
+│   ├── 성공 → level = "tier3_inference"
+│   └── 실패 → 실패 기록, fallback 결과 유지
+│
+├── 6. limit까지 truncate (기본 20, 최대 100)
+│
+├── 7. A/B 실험 할당 (non-blocking)
+│   ├── SMEMBERS experiment:active → 활성 실험 ID
+│   ├── FNV-1a hash(user_id) % 100 → 버킷 [0-99]
+│   └── 누적 traffic% 매칭 → experiment_id + model_version
+│
+└── 8. JSON 응답 반환
+    {
+      "items": [...],
+      "tier": "tier2_rerank",
+      "experiment_id": "exp_v2",
+      "model_version": "dcn_v2_20240315"
+    }
+```
+
+### 아직 구현되지 않은 기능
+
+| 기능 | 상태 | 영향 |
+|------|------|------|
+| 실시간 피처 파이프라인 (Flink → DragonflyDB) | 키 패턴만 정의, 파이프라인 미구현 | clicks_1h, views_1d, ctr_7d 피처 부재 |
+| 4시간 증분 사전 계산 (Spark) | 계획됨 | 추천 최대 7일까지 stale |
+| PostgreSQL 아이템 카탈로그 | 스키마 미생성 | 복합 필터링 불가 (가격, 카테고리 등) |
+| 유저/아이템 임베딩 feature store 조회 | Placeholder 제로 벡터 | Tier 3 스코어링 무의미 |
+| 세션 이벤트 TTL/정리 | TTL 미설정 | 장기 세션에서 메모리 누수 |
+
+---
+
+## 데이터 아키텍처 & 성능 고려사항
+
+### DragonflyDB 키 스키마
+
+DragonflyDB는 실시간 서빙 경로의 **유일한 데이터 저장소**입니다. PostgreSQL은 Airflow의 배치 오케스트레이션 메타데이터용으로만 사용됩니다.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  추천 (RECOMMENDATIONS)                                          │
+│  rec:{user_id}:top_k     STRING(JSON)  100개 아이템  TTL: 7일   │
+│  rec:popular:top_k        STRING(JSON)  100개 아이템  TTL: 없음  │
+├─────────────────────────────────────────────────────────────────┤
+│  피처 (FEATURES) — 정의됨, 아직 미적재                             │
+│  feat:user:{uid}:clicks_1h    INT       1시간 윈도우   TTL: 2시간 │
+│  feat:user:{uid}:views_1d     INT       1일 윈도우    TTL: 2일   │
+│  feat:user:{uid}:recent_items LIST      최근 50개     TTL: 7일   │
+│  feat:item:{iid}:ctr_7d       FLOAT     7일 CTR      TTL: 8일   │
+│  feat:item:{iid}:popularity   FLOAT     인기도 점수   TTL: 1일   │
+├─────────────────────────────────────────────────────────────────┤
+│  재고 (STOCK)                                                    │
+│  stock:bitmap               BITMAP     100만 비트    TTL: 없음   │
+│  stock:id_map:{item_id}     STRING     비트 오프셋   TTL: 없음   │
+│  stock:next_bit_pos         INT        카운터        TTL: 없음   │
+├─────────────────────────────────────────────────────────────────┤
+│  세션 (SESSION)                                                   │
+│  session:{sid}:events       ZSET       JSON 멤버     TTL: 없음   │
+├─────────────────────────────────────────────────────────────────┤
+│  실험 (EXPERIMENTS)                                               │
+│  experiment:active          SET        실험 ID       TTL: 없음   │
+│  experiment:{exp_id}        STRING(JSON) 설정         TTL: 없음   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 성능 병목 & 트레이드오프
+
+#### 1. 재고 필터링: 2-Pipeline 패턴
+
+```
+Pipeline 1: GET stock:id_map:{item_id} × 100개  →  100회 문자열 조회
+Pipeline 2: GETBIT stock:bitmap {offset} × 100개  →  100회 비트 읽기
+합계: 요청당 DragonflyDB 2회 round trip
+```
+
+| 접근법 | Round Trips | 레이턴시 | 트레이드오프 |
+|--------|-------------|---------|------------|
+| 현재 (2-pipeline) | 2 | ~2-5ms | 깔끔한 분리, 2회 통신 |
+| 오프셋을 추천에 미리 내장 | 1 | ~1-2ms | 빠르지만 저장 객체 커짐 |
+| 클라이언트 사이드 Bloom filter | 0 | ~0.1ms | 가장 빠르지만 false positive 존재 |
+
+**현재 선택:** 2-pipeline이 <5ms로 수용 가능. 재고 확인이 병목이 되면 추천 객체에 오프셋을 미리 포함시켜 1회 round trip으로 줄일 수 있음.
+
+#### 2. JSON 직렬화 오버헤드
+
+모든 추천이 DragonflyDB에 JSON 문자열로 저장됩니다. 매 읽기마다 100개 아이템 배열의 `json.Unmarshal`이 필요합니다.
+
+| 포맷 | 100개 Unmarshal | 크기 | 트레이드오프 |
+|------|----------------|------|------------|
+| JSON | ~0.5ms | ~4KB | 가독성 좋음, 표준 |
+| MessagePack | ~0.2ms | ~2.5KB | 2배 빠름, 40% 작음 |
+| Protobuf | ~0.15ms | ~2KB | 3배 빠름, 스키마 필요 |
+| Pre-parsed (Go gob) | ~0.05ms | ~3KB | 가장 빠름, Go 전용 |
+
+**현재 선택:** 단순성과 디버깅 편의를 위해 JSON. 인스턴스당 1K+ RPS에서 ~0.5ms 오버헤드는 병목이 아님 (DragonflyDB 네트워크 레이턴시가 지배적). 인스턴스당 5K+ RPS 시 재검토 필요.
+
+#### 3. 세션 이벤트 무한 축적 (TTL 없음)
+
+세션 이벤트가 TTL이나 크기 제한 없이 ZSET에 저장됩니다:
+
+```
+session:{session_id}:events  →  멤버 수 제한 없는 ZSET
+```
+
+| 리스크 | 영향 | 완화 방안 |
+|--------|------|----------|
+| 장기 세션 (>1000 이벤트) | 메모리 팽창, ZREVRANGE 느려짐 | 24시간 이상 이벤트에 ZREMRANGEBYSCORE 적용 |
+| 폐기된 세션 | 고아 키가 메모리 소비 | 세션 키에 TTL 설정 (예: 24시간) |
+| 핫 세션 (파워 유저) | 대형 ZSET 스캔 | ZREMRANGEBYRANK로 200개 캡 |
+
+**권장:** 첫 쓰기 시 `EXPIRE session:{sid}:events 86400` (24시간 TTL) 추가, `ZREMRANGEBYRANK session:{sid}:events 0 -201`로 200개 캡.
+
+#### 4. DragonflyDB 커넥션 & 타임아웃 튜닝
+
+현재 설정은 **3개의 독립 클라이언트 풀**을 생성합니다:
+
+```go
+// Store 클라이언트 (추천)        → PoolSize: 100, Timeout: 10ms
+// Reranker 클라이언트 (세션 이벤트) → PoolSize: 100, Timeout: 10ms
+// Stock 클라이언트 (비트맵 연산)    → PoolSize: 100, Timeout: 기본값
+// 합계: 인스턴스당 300 커넥션
+```
+
+| 이슈 | 근거 | 권장사항 |
+|------|------|---------|
+| 10ms 타임아웃이 너무 공격적 | 벤치마크에서 experiment 라우팅 타임아웃 다수 발생 | 비핵심 경로는 50-100ms로 완화 |
+| 인스턴스당 300 커넥션 | 250 인스턴스 = DragonflyDB에 75K 커넥션 | 커넥션 멀티플렉싱 또는 풀 크기 감소 |
+| 읽기 레플리카 없음 | 모든 읽기가 primary 히트 | 추천/인기 읽기용 읽기 레플리카 추가 |
+
+#### 5. 사전 계산 추천의 Staleness 문제
+
+```
+배치 계산 → DragonflyDB SET (TTL: 7일) → 유저 요청이 캐시 결과 읽기
+                ↑                                        ↓
+          갱신 주기: ?                         다음 갱신까지 stale 데이터 서빙
+```
+
+| 갱신 전략 | 신선도 | 비용 | 복잡도 |
+|----------|--------|------|--------|
+| 현재 (시드만) | 최대 7일 stale | 운영 비용 없음 | 최저 |
+| 일일 전체 재계산 | 최대 24시간 stale | 높음 (전체 Spark 잡) | 중간 |
+| 4시간 증분 | 최대 4시간 stale | 중간 (증분) | 중간 |
+| 준실시간 (Flink) | 수분 | 높음 (지속적 계산) | 최고 |
+
+**계획된 접근:** Airflow DAG로 트리거되는 4시간 증분 재계산 via Spark. 신선도와 비용의 균형 — 전체 재계산은 비피크 시 일일, 증분은 4시간마다 실행.
+
+#### 6. PostgreSQL 미연동
+
+아키텍처 다이어그램에는 아이템 카탈로그와 유저 메타데이터용 PostgreSQL이 표시되어 있지만, 서빙 경로는 **DragonflyDB만 사용**합니다:
+
+```
+현재:    recommendation-api → DragonflyDB만
+계획:    recommendation-api → DragonflyDB (핫 패스)
+                             → PostgreSQL (콜드 패스: 카탈로그 쿼리, 관리)
+```
+
+| 기능 | DragonflyDB | PostgreSQL | 갭 |
+|------|-------------|------------|-----|
+| 유저 Top-K 추천 조회 | 가능 (STRING) | 불필요 | — |
+| 가격 범위 필터 | 미지원 | WHERE price BETWEEN | **갭** |
+| 카테고리 필터 | 미지원 | WHERE category_id = | **갭** |
+| 아이템 메타데이터 (이름, 이미지 등) | 미저장 | 전체 카탈로그 | **갭** |
+| 복잡한 분석 쿼리 | SQL 없음 | 전체 SQL | **갭** |
+
+**권장:** PostgreSQL을 아이템 카탈로그의 source of truth로 사용. CDC (Change Data Capture) 또는 배치 ETL로 DragonflyDB에 동기화. recommendation-api는 핫 패스에서 PostgreSQL을 직접 쿼리하지 않고, 비정규화된 DragonflyDB 캐시에서 아이템 메타데이터를 보강해야 함.
+
+#### 7. 스케일링 의사결정 트리
+
+```
+                        ┌─ 레이턴시 높음?
+                        │   ├─ p50 > 20ms → DragonflyDB 커넥션 풀 포화 확인
+                        │   ├─ p95 > 100ms → 재고 필터 파이프라인 확인 (2 round trips)
+                        │   └─ p99 > 200ms → Tier 3 circuit breaker 확인 (Triton 타임아웃)
+                        │
+현재 RPS ─────────────── ├─ 에러율 높음?
+  (~1K/인스턴스)         │   ├─ 5xx 에러 → DragonflyDB 연결성 / 풀 고갈 확인
+                        │   ├─ 타임아웃 에러 → 읽기 타임아웃 증가 (10ms → 50ms)
+                        │   └─ Circuit open → Triton 비정상, GPU 상태 확인
+                        │
+                        └─ 더 높은 처리량 필요?
+                            ├─ < 5K RPS → 인스턴스 추가 (수평 확장)
+                            ├─ < 50K RPS → DragonflyDB 읽기 레플리카 추가
+                            ├─ < 200K RPS → user_id 해시 기반 DragonflyDB 샤딩
+                            └─ > 200K RPS → CDN 레이어 추가 (Tier 0, 인기 상품)
+```
+
+---
+
 ## 빠른 시작
 
 ### 사전 요구사항
