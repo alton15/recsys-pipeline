@@ -1,12 +1,14 @@
 ### Builder stage
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 RUN apk add --no-cache git
 
 WORKDIR /build
 
-# Copy go.work and module files first for layer caching.
-COPY go.work go.work
+# Disable go.work — build with module replace directives only.
+ENV GOWORK=off
+
+# Copy module files first for layer caching.
 COPY shared/go/go.mod shared/go/go.sum* shared/go/
 COPY services/recommendation-api/go.mod services/recommendation-api/go.sum* services/recommendation-api/
 

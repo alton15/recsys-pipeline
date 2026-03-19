@@ -88,7 +88,7 @@ func main() {
 				return
 			}
 
-			resp, err := client.Post(collectorURL+"/v1/events", "application/json", bytes.NewReader(body))
+			resp, err := client.Post(collectorURL+"/api/v1/events", "application/json", bytes.NewReader(body))
 			if err != nil {
 				mu.Lock()
 				failures++

@@ -70,6 +70,10 @@ func NewClient(grpc GRPCInferenceClient, timeout time.Duration) *Client {
 // Score sends a single inference request and returns the relevance score.
 // It validates input dimensions and enforces the configured timeout.
 func (c *Client) Score(ctx context.Context, userEmb, itemEmb []float32, ctxFeat []float32) (float32, error) {
+	if c.grpc == nil {
+		return 0, fmt.Errorf("triton gRPC client is not configured")
+	}
+
 	if err := validateDimensions(userEmb, itemEmb, ctxFeat); err != nil {
 		return 0, err
 	}
@@ -110,6 +114,10 @@ func (c *Client) Score(ctx context.Context, userEmb, itemEmb []float32, ctxFeat 
 // batch sizes. The user embedding is tiled across the batch dimension, and
 // item embeddings + context features are concatenated along the batch axis.
 func (c *Client) ScoreBatch(ctx context.Context, items []BatchItem) ([]float32, error) {
+	if c.grpc == nil {
+		return nil, fmt.Errorf("triton gRPC client is not configured")
+	}
+
 	if len(items) == 0 {
 		return []float32{}, nil
 	}
