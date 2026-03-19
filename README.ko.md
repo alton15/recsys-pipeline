@@ -220,6 +220,415 @@ graph TB
 
 ---
 
+## 컴포넌트 아키텍처
+
+각 컴포넌트가 존재하는 이유, 어떤 역할을 하는지, 내부적으로 어떻게 동작하는지 설명합니다.
+
+### Envoy Gateway — 트래픽 게이트
+
+**왜 필요한가:** 모든 백엔드를 과부하로부터 보호하는 단일 진입점. 없으면 트래픽 스파이크가 모든 서비스에 동시에 전파됩니다.
+
+**동작 방식:**
+- 포트 10000에서 수신, URL 경로 기반으로 event-collector 또는 recommendation-api로 라우팅
+- 토큰 버킷 rate limiter: 초당 10,000 토큰 — 초과 요청은 백엔드 도달 전 HTTP 429 응답
+- 클러스터별 circuit breaker: 백엔드당 최대 1024 연결, 1024 동시 요청
+- 5초 연결 타임아웃으로 느린 백엔드가 연결을 점유하는 것을 방지
+
+```
+인터넷 → Envoy (:10000)
+           ├─ /api/v1/events     → event-collector:8080
+           ├─ /api/v1/recommend  → recommendation-api:8090
+           └─ /api/v1/popular    → recommendation-api:8090
+```
+
+**프로덕션 규모:** 10개 파드, 각 2 CPU / 2GB. Envoy의 C++ 스레드 모델로 파드당 ~50K 동시 연결 처리.
+
+---
+
+### Event Collector — 이벤트 수집
+
+**왜 필요한가:** 이벤트 생산자(클라이언트 앱)와 소비자(스트림 프로세서, 배치 파이프라인)를 분리합니다. HTTP를 받아 검증 후 Redpanda에 발행 — 클라이언트가 메시지 브로커에 직접 접근하지 않습니다.
+
+**동작 방식:**
+
+```
+POST /api/v1/events
+  { "event_type": "click", "user_id": "u_001", "item_id": "i_042" }
+         │
+         ▼
+  ┌─ 검증 ─────────────────────────────────────────┐
+  │  event_type ∈ {click, view, purchase, search,   │
+  │                add_to_cart, remove_from_cart}     │
+  │  user_id 필수, item_id 필수                       │
+  └─────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─ 보강 ─────────────────────────────────────────┐
+  │  event_id = UUID v4 (서버 생성)                   │
+  │  timestamp = time.Now().UTC()                     │
+  └─────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─ 발행 ─────────────────────────────────────────┐
+  │  Redpanda 토픽: user-events                      │
+  │  파티션 키: user_id (유저별 순서 보장)              │
+  │  배치: 최대 1MB, 5ms linger                       │
+  │  전달: 비동기 fire-and-forget                      │
+  └─────────────────────────────────────────────────┘
+         │
+         ▼
+  HTTP 202 Accepted { "event_id": "...", "status": "accepted" }
+```
+
+**핵심 설계:**
+- **파티션 키 = user_id**: 유저별 이벤트 순서 보장 (클릭 → 구매 순서 역전 방지)
+- **비동기 발행**: Redpanda 확인 전 HTTP 응답 반환. 처리량 극대화 (단일 인스턴스 2,700 RPS), 드문 브로커 장애 시 최대 1회 전달 손실
+- **서버 생성 event_id**: 클라이언트가 UUID 생성 불필요, 연동 복잡도 감소
+
+**프로덕션 규모:** 50개 파드, 각 2 CPU / 4GB. 피크 시 HPA로 200개까지 확장.
+
+---
+
+### Redpanda — 이벤트 스트리밍 백본
+
+**왜 필요한가:** 실시간 이벤트 수집과 다운스트림 소비자 사이의 다리. Kafka 호환 프로토콜로 기존 모든 Kafka 도구 사용 가능, C++ thread-per-core로 JVM GC 중단 없이 일관된 p99 레이턴시 보장.
+
+**동작 방식:**
+- **토픽 `user-events`**: user_id로 파티셔닝. Event collector가 발행, 스트림 프로세서와 배치 파이프라인이 소비
+- **토픽 `inventory-events`**: item_id로 파티셔닝. 재고 시스템이 발행, 스트림 프로세서가 비트맵 업데이트용으로 소비
+- **Dev 모드**: 단일 브로커, SMP=1, 1GB 메모리. ZooKeeper/KRaft 없이 자체 완결형
+- **보존**: 이벤트 로그는 배치 재처리를 위해 MinIO(S3)에도 아카이빙
+
+**왜 Kafka가 아닌가:** 50M DAU에서 Kafka는 ~50 브로커 필요 ($25K/월) vs Redpanda ~12 브로커 ($6K/월). C++ thread-per-core 모델로 노드당 4배 처리량, 결정적 p99 레이턴시 (<5ms vs Kafka GC 중 10-50ms).
+
+**프로덕션 규모:** 12 브로커, 각 8 CPU / 32GB. 내구성을 위한 복제 팩터 3.
+
+---
+
+### Stream Processor — 실시간 피처 엔진 (Apache Flink)
+
+**왜 필요한가:** 원시 이벤트를 서빙 레이어가 실시간으로 사용할 수 있는 피처로 변환합니다. 이것 없이는 모든 피처가 시간 단위로 stale합니다 (배치 전용). 스트림 프로세서가 "이 유저가 지난 1시간에 뭘 했는지?"를 밀리초 내에 답할 수 있게 합니다.
+
+**동작 방식 — 3개 병렬 브랜치:**
+
+```
+Redpanda: user-events
+    │
+    ├─── 브랜치 1: 클릭 집계 ───────────────────────────────────
+    │    keyBy(user_id) → SlidingWindow(1시간, 1분) → 클릭 수 집계
+    │    출력: DragonflyDB SET feat:user:{uid}:clicks_1h {count}
+    │          TTL: 3660초 (1시간 + 1분 버퍼)
+    │
+    ├─── 브랜치 2: 세션 버퍼 ────────────────────────────────────
+    │    keyBy(session_id) → 상태 유지 KeyedProcessFunction
+    │    이벤트마다: ZADD session:{sid}:events {timestamp} {json}
+    │    출력: DragonflyDB ZSET (최근 이벤트 유지, TTL 30분)
+    │
+Redpanda: inventory-events
+    │
+    └─── 브랜치 3: 재고 비트맵 ──────────────────────────────────
+         keyBy(item_id) → 비트맵 오프셋 해싱
+         재고 변경마다:
+           SETBIT stock:bitmap {offset} {0|1}
+           SET stock:id_map:{item_id} {offset}
+         출력: DragonflyDB BITMAP (O(1) 재고 확인)
+```
+
+**핵심 설계:**
+- **슬라이딩 윈도우** (텀블링 아님): 텀블링 1시간 윈도우는 매시간 0으로 리셋됨. 1분 슬라이드의 1시간 슬라이딩 윈도우는 "최근 60분간 클릭 수"를 지속적으로 업데이트
+- **세션 키잉**: user_id가 아닌 session_id로 그룹화. 유저가 여러 세션 동시 사용 가능 (모바일 + 데스크톱)
+- **재고용 비트맵**: 전통적 접근은 아이템마다 DB 쿼리. 비트맵은 100만 아이템을 125KB로 압축, O(1) 재고 확인 가능
+
+**프로덕션 규모:** Flink TaskManager 25개, 각 4 CPU / 8GB. exactly-once 보장을 위해 MinIO로 체크포인팅.
+
+---
+
+### DragonflyDB — 통합 피처 스토어
+
+**왜 필요한가:** 모든 컴포넌트가 빠른 읽기를 필요로 합니다. recommendation-api가 캐시된 추천, 세션 이벤트, 재고 비트맵, 실험 설정을 모두 한 곳에서 읽습니다. DragonflyDB의 멀티스레드 shared-nothing 아키텍처가 노드당 500-800K ops/s를 달성 (Redis의 100K 대비), 클러스터를 100노드에서 10노드로 축소.
+
+**동작 방식:**
+- **Redis 호환 프로토콜**: 모든 Go Redis 클라이언트(go-redis) 변경 없이 사용. 드롭인 대체
+- **멀티스레드**: 단일 스레드 Redis와 달리 shared-nothing 아키텍처로 모든 CPU 코어 활용
+- **Dash 해시 테이블**: 동일 데이터에 대해 Redis 해시 테이블보다 30% 적은 메모리 사용
+
+| 타입 | 키 패턴 | 사용 주체 | 접근 패턴 |
+|------|---------|----------|----------|
+| STRING (JSON) | `rec:{uid}:top_k` | 배치 → Rec API | 1회 쓰기, 다수 읽기 |
+| STRING (JSON) | `rec:popular:top_k` | 배치 → Rec API / CDN | 1회 쓰기, 브로드캐스트 읽기 |
+| BITMAP | `stock:bitmap` | Flink → Rec API | 지속 쓰기, 빈번 읽기 |
+| ZSET | `session:{sid}:events` | Flink → Rec API | 추가 쓰기, 범위 읽기 |
+| SET | `experiment:active` | 관리자 → Rec API | 드문 쓰기, 빈번 읽기 |
+| INT | `feat:user:{uid}:clicks_1h` | Flink → (향후) Rec API | 지속 쓰기, 스코어링 시 읽기 |
+
+**프로덕션 규모:** 10노드, 각 8 CPU / 64GB. 총 ~4M ops/s 용량.
+
+---
+
+### Milvus — 벡터 유사도 검색
+
+**왜 필요한가:** 유저 임베딩(128차원 벡터)이 주어지면 수백만 아이템 임베딩 중 가장 유사한 100개를 찾습니다. Two-Tower 검색 모델의 핵심. 100만 아이템 brute-force 비교는 ~50ms이지만 Milvus의 HNSW 인덱스는 <5ms에 수행.
+
+**동작 방식:**
+- **컬렉션 `item_embeddings`**: Two-Tower 모델의 아이템 타워가 생성한 128차원 아이템 벡터 저장
+- **인덱스 HNSW**: 다층 그래프에서 각 노드가 최근접 이웃과 연결. 상위 레이어(대략적)에서 하위 레이어(정밀)로 탐색
+- **배치 파이프라인이 사용**: 각 유저에 대해 `Milvus.search(user_embedding, top_k=100)` 호출, 결과를 DragonflyDB에 캐시
+
+**왜 서빙 시점에 사용하지 않는가:** 150K RPS에서의 ANN 검색은 Milvus의 대규모 확장이 필요. 대신 결과를 사전 계산하고 캐시. Milvus는 배치 파이프라인(일간/4시간)에서만 쿼리.
+
+**프로덕션 규모:** 8노드, 각 8 CPU / 32GB. HNSW 또는 IVF_FLAT 인덱스로 10억 스케일 벡터 지원.
+
+---
+
+### Recommendation API — 오케스트레이터
+
+**왜 필요한가:** 모든 것을 하나로 묶는 중앙 두뇌. 5+ 마이크로서비스(피처 스토어, 후보 생성, 랭커, 필터, 실험 라우터)로 fan-out하는 대신 단일 Go 바이너리에 모든 로직을 내장. 4+ 네트워크 홉 제거로 p99를 ~57ms에서 ~15ms로 단축.
+
+**3개 엔드포인트:**
+
+| 엔드포인트 | 목적 | SLA |
+|-----------|------|-----|
+| `GET /api/v1/recommend` | 개인화 추천 | <100ms p99 |
+| `GET /api/v1/popular` | 글로벌 인기 상품 (CDN 캐시 가능) | <5ms |
+| `GET /health` | DragonflyDB 연결 상태 확인 | <2s |
+
+**내장 컴포넌트 (상호 간 네트워크 호출 없음):**
+
+```
+recommendation-api 바이너리
+  ├── DragonflyStore         — 캐시 읽기/쓰기 (추천, 인기)
+  ├── BitmapChecker          — 비트맵 기반 재고 확인
+  ├── SessionFeatureExtractor — ZSET에서 세션 이벤트 읽기
+  ├── WeightedScorer         — 세션 기반 점수 조정
+  ├── SessionReranker        — 추출 → 스코어링 → 정렬 오케스트레이션
+  ├── ProtectedRanker        — Triton gRPC + circuit breaker
+  ├── DegradationManager     — 4단계 부하 분산 상태 머신
+  ├── ExperimentRouter       — A/B용 FNV-1a 일관된 해싱
+  ├── TierRouter             — 멀티 티어 캐스케이드 오케스트레이터
+  └── Prometheus metrics     — 티어별 카운터, 히스토그램, 게이지
+```
+
+**Degradation 상태 머신** — API는 절대 빈 응답을 반환하지 않음:
+
+```
+Normal    (부하 < 1.5배)  →  모든 티어 활성
+Warning   (부하 ≥ 1.5배)  →  Tier 3 (GPU) 비활성
+Critical  (부하 ≥ 2.0배)  →  Tier 2 + 3 비활성
+Emergency (부하 ≥ 3.0배)  →  CDN 폴백 전용 (인기 상품)
+```
+
+**프로덕션 규모:** 250개 파드, 각 4 CPU / 8GB. 피크 시 HPA로 1,000까지 확장. 파드당 ~1,050 RPS (벤치마크 검증됨).
+
+---
+
+### Ranking Service / Triton — GPU 추론
+
+**왜 필요한가:** 콜드 스타트 유저(캐시된 추천 없음)는 실시간 개인화가 필요합니다. DCN-V2 모델이 유저/아이템 임베딩과 컨텍스트 피처를 기반으로 후보 아이템을 스코어링합니다. Triton의 동적 배칭이 개별 요청을 GPU 배치로 그룹화하여 효율적 활용.
+
+**동작 방식:**
+
+```
+ProtectedRanker.Rank(userID, candidates)
+        │
+        ▼
+  CircuitBreaker.Allow()?
+  ├── Open (30초 내 5회+ 실패) → 즉시 에러 반환
+  └── Closed/HalfOpen → 진행
+        │
+        ▼
+  BatchItem[] 구성
+  ├── UserEmbedding:   128차원 (피처 스토어에서)
+  ├── ItemEmbedding:   128차원 (피처 스토어에서)
+  └── ContextFeatures: 32차원 (세션 컨텍스트)
+        │
+        ▼
+  Triton gRPC: ModelInfer(dcn_v2, batch)
+  ├── 동적 배칭: 32/64/128 선호 배치 크기
+  ├── TensorRT INT8 양자화: FP32 대비 3배 처리량
+  └── 타임아웃: 80ms (context deadline)
+        │
+        ▼
+  점수 내림차순 정렬
+  랭킹된 리스트 반환
+```
+
+**Circuit breaker 상태:**
+- **Closed** (정상): 모든 요청 통과. 실패 시 카운터 증가
+- **Open** (5회 실패 후): 모든 요청 즉시 에러로 거부. 타이머 시작 (30초)
+- **Half-Open** (30초 후): 요청 1건 허용. 성공 → Closed. 실패 → Open
+
+**왜 전체 트래픽의 0.9%만 Tier 3에 도달하는가:** 3-Tier 전략이 85% 유저의 추천을 사전 계산 (Tier 1 캐시 히트). 세션 재랭킹이 12% 처리. 콜드 스타트/실험 유저만 GPU 추론. GPU 비용을 $60K/월(전체 GPU)에서 $4.8K/월로 절감.
+
+**프로덕션 규모:** 8개 파드, 4 CPU / 16GB + NVIDIA L4 GPU 1개씩. HPA로 32개까지 확장.
+
+---
+
+### Batch Processor — 오프라인 인텔리전스 (PySpark + Airflow)
+
+**왜 필요한가:** ML 모델 학습과 5천만 유저의 추천 사전 계산은 실시간으로 불가능합니다. 배치 프로세서가 비피크 시간에 저렴한 스팟 인스턴스에서 실행하여, 요청당 계산하기에는 비용이 너무 높은 피처를 생성합니다.
+
+**동작 방식 — 4단계:**
+
+```
+1단계: 피처 엔지니어링 (PySpark)
+────────────────────────────────
+원시 이벤트 (PostgreSQL/MinIO)
+  ↓ groupBy(user_id)
+  ├── total_clicks, total_views, total_purchases
+  ├── category_interests (상호작용한 카테고리 셋)
+  └── total_events
+  ↓ groupBy(item_id)
+  ├── click_count, purchase_count
+  ├── ctr = clicks / max(views, 1)
+  └── unique_users
+
+2단계: 모델 학습 (PyTorch + DeepSpeed)
+──────────────────────────────────────
+피처 + 라벨 → Two-Tower 모델 학습
+  ├── User tower: user_id(64d) + categories(32d) → MLP → 128d 임베딩
+  └── Item tower: item_id(64d) + category(32d) + price(32d) → MLP → 128d 임베딩
+피처 + 라벨 → DCN-V2 모델 학습
+  └── user_emb(128d) + item_emb(128d) + context(32d) → cross network → 점수
+
+3단계: 임베딩 생성 & 인덱싱
+──────────────────────────
+Item tower → 아이템 임베딩 배치 생성
+  ↓ 대량 삽입
+Milvus ANN 인덱스 (item_embeddings 컬렉션, 128차원, HNSW)
+
+4단계: 추천 사전 계산
+────────────────────
+유저별 (배치, 1000명씩):
+  user_embedding → Milvus.search(top_k=100)
+  ↓ 결과
+  DragonflyDB: SET rec:{user_id}:top_k {json} EX 86400
+```
+
+**스케줄링 (Airflow):**
+- **일간 전체 파이프라인**: 4단계 모두. 트래픽 최저 시 새벽 3시 실행
+- **4시간 증분**: 1단계(최근 이벤트만) + 4단계(업데이트된 유저만)
+
+**프로덕션 규모:** 스팟 인스턴스 Spark (60% 비용 절감). 최소 상시 가동 노드에서 Airflow.
+
+---
+
+### PostgreSQL — 메타데이터 저장소
+
+**왜 필요한가:** 관계형 데이터(아이템 카탈로그, 유저 프로필, 실험 이력)는 ACID 트랜잭션과 DragonflyDB가 제공할 수 없는 복잡한 쿼리가 필요합니다. PostgreSQL이 source of truth, DragonflyDB는 서빙 캐시.
+
+**현재 사용:**
+- Airflow 메타데이터 데이터베이스 (DAG 실행, 태스크 상태, 연결)
+- 계획: 아이템 카탈로그 (이름, 설명, 가격, 카테고리, 이미지), 유저 메타데이터, 실험 결과
+
+**구조:**
+
+```
+PostgreSQL (source of truth)
+  ├── items 테이블: id, name, category, price, image_url, created_at
+  ├── users 테이블: id, preferences, signup_date
+  └── experiments 테이블: id, config, results, created_at
+       │
+       ├──→ (CDC 또는 배치 ETL) → DragonflyDB (서빙 캐시)
+       └──→ (직접 쿼리) → 관리자 대시보드, 분석
+```
+
+**프로덕션 규모:** 스트리밍 복제가 있는 HA 클러스터. 핫 서빙 경로에 없음.
+
+---
+
+### MinIO — 오브젝트 스토리지
+
+**왜 필요한가:** 이벤트 로그, 모델 아티팩트, 학습 데이터는 내구성 있고 저렴한 스토리지가 필요합니다. MinIO는 어디서든 실행 가능한 S3 호환 오브젝트 스토리지 — 온프레미스든 클라우드든 벤더 종속 없음.
+
+**저장 내용:**
+- 원시 이벤트 로그 (Redpanda에서 아카이빙)
+- 모델 체크포인트 (PyTorch .pt 파일)
+- ONNX 내보내기 모델 (Triton 배포용)
+- 학습 데이터셋 (피처 매트릭스)
+- Spark 중간 데이터
+
+---
+
+### 모니터링 스택 — 관측성 레이어
+
+**왜 필요한가:** 50M DAU에서 로그 읽기로 디버깅은 불가능합니다. 모니터링 스택이 모든 컴포넌트의 상태를 실시간 가시화하고, 자동 알림이 degradation 상태 머신을 트리거합니다.
+
+```
+┌─ Prometheus ────────────────────────────────────────────────┐
+│  15초마다 메트릭 수집:                                        │
+│  ├── event-collector:2112  (요청, 에러, 레이턴시)             │
+│  ├── recommendation-api:2112 (티어별 메트릭, CB 상태)        │
+│  ├── redpanda:9644 (파티션 랙, 브로커 상태)                  │
+│  └── dragonfly:6380 (메모리, 제거율, 커맨드 레이턴시)         │
+│  저장: 7일 TSDB 보존                                         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+┌─ Grafana ──┐ ┌─ Alertmanager ┐ ┌─ Jaeger ────────────┐
+│ 대시보드    │ │ 알림 라우팅    │ │ 분산 트레이싱       │
+│ 티어별     │ │ PagerDuty/    │ │ OTLP 수집기        │
+│ 레이턴시,  │ │ Slack/Email   │ │ 서비스간 요청       │
+│ 처리량     │ │ 연동          │ │ 워터폴             │
+└────────────┘ └───────────────┘ └─────────────────────┘
+```
+
+**recommendation-api가 노출하는 커스텀 메트릭:**
+
+| 메트릭 | 타입 | 라벨 | 목적 |
+|--------|------|------|------|
+| `recsys_requests_total` | Counter | tier | 티어별 트래픽 분포 추적 |
+| `recsys_request_duration_seconds` | Histogram | tier | 티어별 레이턴시 (버킷: 1/5/10/20/50/100ms) |
+| `recsys_errors_total` | Counter | tier | 티어별 에러율 |
+| `recsys_circuit_breaker_state` | Gauge | tier | 0=closed, 1=open, 2=half-open |
+
+---
+
+### 전체 데이터 흐름 (End-to-End)
+
+하나의 유저 상호작용이 전체 시스템을 관통하는 흐름:
+
+```
+1. 유저가 앱에서 아이템 클릭
+        │
+        ▼
+2. POST /api/v1/events → Envoy → Event Collector
+   검증, event_id 할당, Redpanda에 발행
+        │
+        ▼
+3. Redpanda: user-events 토픽 (파티션 키 = user_id)
+        │
+        ├──────────────────────────────┐
+        ▼                              ▼
+4. Flink 스트림 프로세서           5. MinIO (아카이빙)
+   ├── clicks_1h 카운터 업데이트       │
+   ├── 세션 이벤트 추가                 ▼
+   └── (재고 이벤트면)             6. Spark 배치 (일간)
+       비트맵 업데이트                  ├── 피처 엔지니어링
+        │                              ├── 모델 학습
+        ▼                              ├── 임베딩 생성
+   DragonflyDB (피처)                 └── 추천 사전 계산
+                                           │
+                                           ▼
+                                       DragonflyDB (추천)
+                                       Milvus (ANN 인덱스)
+                                           │
+7. 유저가 추천 요청                         │
+        │                                  │
+        ▼                                  │
+8. GET /api/v1/recommend → Envoy → Recommendation API
+   ├── DragonflyDB에서 캐시된 추천 읽기 ←──┘
+   ├── 품절 필터링 (비트맵)
+   ├── 세션 컨텍스트로 재랭킹 (ZSET)
+   ├── (선택) Triton GPU 추론
+   └── 개인화 리스트 반환
+        │
+        ▼
+9. 유저가 추천 확인, 다른 아이템 클릭 → 1단계로 복귀
+```
+
+---
+
 ## 3-Tier 서빙 전략
 
 핵심 인사이트: **모든 요청에 GPU 추론을 실행하지 않는다.** 대부분의 사용자에게는 사전 계산된 결과를 제공하고, 캐시 미스 시에만 실시간 추론을 실행합니다.

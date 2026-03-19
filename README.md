@@ -236,6 +236,427 @@ graph TB
 
 ---
 
+## Component Architecture
+
+Each component exists for a specific reason. This section explains **what** each one does, **why** it's in the architecture, and **how** it works internally.
+
+### Envoy Gateway — Traffic Gate
+
+**Why it exists:** A single entry point that protects all backends from overload. Without it, a traffic spike would cascade into every service simultaneously.
+
+**How it works:**
+- Listens on port 10000, routes requests to event-collector or recommendation-api based on URL path
+- Token bucket rate limiter at 10K tokens/second — excess requests get HTTP 429 before touching any backend
+- Per-cluster circuit breakers: max 1024 connections and 1024 concurrent requests per backend
+- 5-second connect timeout prevents slow backends from holding connections
+
+```
+Internet → Envoy (:10000)
+             ├─ /api/v1/events     → event-collector:8080
+             ├─ /api/v1/recommend  → recommendation-api:8090
+             └─ /api/v1/popular    → recommendation-api:8090
+```
+
+**Production scale:** 10 pods, each 2 CPU / 2GB. Envoy's C++ thread model handles ~50K concurrent connections per pod.
+
+---
+
+### Event Collector — Event Ingestion
+
+**Why it exists:** Decouples event producers (client apps) from event consumers (stream processor, batch pipeline). Accepts HTTP, validates, and publishes to Redpanda — clients never talk directly to the message broker.
+
+**How it works:**
+
+```
+POST /api/v1/events
+  { "event_type": "click", "user_id": "u_001", "item_id": "i_042" }
+         │
+         ▼
+  ┌─ Validate ─────────────────────────────────────┐
+  │  event_type ∈ {click, view, purchase, search,  │
+  │                add_to_cart, remove_from_cart}    │
+  │  user_id required, item_id required             │
+  └────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─ Enrich ───────────────────────────────────────┐
+  │  event_id = UUID v4 (server-generated)          │
+  │  timestamp = time.Now().UTC()                    │
+  └────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─ Produce ──────────────────────────────────────┐
+  │  Redpanda topic: user-events                    │
+  │  Partition key: user_id (ordering per user)     │
+  │  Batch: 1MB max, 5ms linger                     │
+  │  Delivery: async fire-and-forget                │
+  └────────────────────────────────────────────────┘
+         │
+         ▼
+  HTTP 202 Accepted { "event_id": "...", "status": "accepted" }
+```
+
+**Key design choices:**
+- **Partition key = user_id**: Guarantees event ordering per user (click before purchase, never reversed)
+- **Async publish**: The HTTP response returns before Redpanda confirms. Maximizes throughput (2,700 RPS single instance) at the cost of at-most-once delivery for rare broker failures
+- **Server-generated event_id**: Clients don't need to generate UUIDs, reducing integration complexity
+
+**Production scale:** 50 pods, 2 CPU / 4GB each. HPA scales to 200 pods at peak.
+
+---
+
+### Redpanda — Event Streaming Backbone
+
+**Why it exists:** Bridges the gap between real-time event ingestion and downstream consumers. Kafka-compatible protocol means all existing Kafka tooling works, but C++ thread-per-core eliminates JVM GC pauses that cause p99 spikes.
+
+**How it works:**
+- **Topic `user-events`**: Partitioned by user_id. Event collector publishes; stream processor and batch pipeline consume
+- **Topic `inventory-events`**: Partitioned by item_id. Stock system publishes; stream processor consumes for bitmap updates
+- **Dev mode**: Single-broker, SMP=1, 1GB memory. No ZooKeeper or KRaft — self-contained
+- **Retention**: Event logs are also archived to MinIO (S3) for batch reprocessing
+
+**Why not Kafka:** At 50M DAU, Kafka requires ~50 brokers ($25K/mo) vs Redpanda's ~12 brokers ($6K/mo). The C++ thread-per-core model achieves 4x throughput per node with deterministic p99 latency (<5ms vs Kafka's 10-50ms during GC).
+
+**Production scale:** 12 brokers, 8 CPU / 32GB each. Replication factor 3 for durability.
+
+---
+
+### Stream Processor — Real-time Feature Engine (Apache Flink)
+
+**Why it exists:** Transforms raw events into features that the serving layer can use in real-time. Without this, all features would be stale by hours (batch-only). The stream processor makes "what did this user do in the last hour?" answerable in milliseconds.
+
+**How it works — three parallel branches:**
+
+```
+Redpanda: user-events
+    │
+    ├─── Branch 1: Click Aggregation ─────────────────────────────
+    │    keyBy(user_id) → SlidingWindow(1h, 1min) → count clicks
+    │    OUTPUT: DragonflyDB SET feat:user:{uid}:clicks_1h {count}
+    │            TTL: 3660s (1h + 1min buffer)
+    │
+    ├─── Branch 2: Session Buffer ────────────────────────────────
+    │    keyBy(session_id) → stateful KeyedProcessFunction
+    │    For each event: ZADD session:{sid}:events {timestamp} {json}
+    │    OUTPUT: DragonflyDB ZSET (keeps last events, TTL 30min)
+    │
+Redpanda: inventory-events
+    │
+    └─── Branch 3: Stock Bitmap ──────────────────────────────────
+         keyBy(item_id) → hash to bitmap offset
+         For each stock change:
+           SETBIT stock:bitmap {offset} {0|1}
+           SET stock:id_map:{item_id} {offset}
+         OUTPUT: DragonflyDB BITMAP (O(1) availability check)
+```
+
+**Key design choices:**
+- **Sliding window** (not tumbling): A tumbling 1-hour window would reset to zero every hour. Sliding 1-hour window with 1-minute slide means the click count is always "clicks in the last 60 minutes", continuously updated
+- **Session keying**: Events are grouped by session_id, not user_id. A user can have multiple concurrent sessions (mobile + desktop)
+- **Bitmap for stock**: A traditional approach queries a database for each item. The bitmap compresses 1M items into 125KB, enabling O(1) availability checks
+
+**Production scale:** 25 Flink TaskManagers, 4 CPU / 8GB each. Checkpointing to MinIO for exactly-once guarantees.
+
+---
+
+### DragonflyDB — Unified Feature Store
+
+**Why it exists:** Every component needs fast reads. The recommendation-api reads cached recommendations, session events, stock bitmaps, and experiment configs — all from one place. DragonflyDB's multi-threaded shared-nothing architecture delivers 500-800K ops/s per node vs Redis's 100K, reducing the cluster from 100 nodes to 10.
+
+**How it works:**
+- **Redis-compatible protocol**: All Go Redis clients (go-redis) work unchanged. Drop-in replacement
+- **Multi-threaded**: Unlike single-threaded Redis, utilizes all CPU cores via shared-nothing architecture
+- **Dash hash table**: 30% less memory than Redis's hash table for the same data
+- **Data types used**:
+
+| Type | Key Pattern | Used By | Access Pattern |
+|------|------------|---------|---------------|
+| STRING (JSON) | `rec:{uid}:top_k` | Batch processor → Rec API | Write once, read many |
+| STRING (JSON) | `rec:popular:top_k` | Batch processor → Rec API / CDN | Write once, broadcast read |
+| BITMAP | `stock:bitmap` | Flink → Rec API | Continuous write, frequent read |
+| STRING | `stock:id_map:{iid}` | Flink → Rec API | Write once, read with stock |
+| ZSET | `session:{sid}:events` | Flink → Rec API | Append write, range read |
+| SET | `experiment:active` | Admin → Rec API | Rare write, frequent read |
+| STRING (JSON) | `experiment:{eid}` | Admin → Rec API | Rare write, frequent read |
+| INT | `feat:user:{uid}:clicks_1h` | Flink → (future) Rec API | Continuous write, read at scoring |
+
+**Connection model:** 3 client pools per recommendation-api instance (store, reranker, stock), 100 connections each = 300 per instance. At 250 instances = 75K connections total.
+
+**Production scale:** 10 nodes, 8 CPU / 64GB each. ~4M ops/s total capacity.
+
+---
+
+### Milvus — Vector Similarity Search
+
+**Why it exists:** Given a user embedding (128-dim vector), find the 100 most similar item embeddings out of millions. This is the core of the Two-Tower retrieval model. Brute-force comparison over 1M items would take ~50ms; Milvus's HNSW index does it in <5ms.
+
+**How it works:**
+- **Collection `item_embeddings`**: Stores 128-dimensional item vectors generated by the Two-Tower model's item tower
+- **Index type HNSW**: Hierarchical Navigable Small World graph — builds a multi-layer graph where each node connects to its nearest neighbors. Search traverses from top layer (coarse) to bottom layer (fine)
+- **Batch pipeline writes**: After training, all item embeddings are bulk-inserted into Milvus
+- **Pre-compute reads**: For each user, the batch processor calls `Milvus.search(user_embedding, top_k=100)` to find the nearest items, then caches results in DragonflyDB
+
+**Why not used at serving time:** ANN search at 150K RPS would require massive Milvus scaling. Instead, results are pre-computed and cached. Milvus is only queried during the batch pipeline (daily/4-hourly).
+
+**Production scale:** 8 nodes, 8 CPU / 32GB each. Supports billion-scale vectors with IVF_FLAT or HNSW indexes.
+
+---
+
+### Recommendation API — The Orchestrator
+
+**Why it exists:** The central brain that ties everything together. Instead of fanning out to 5+ microservices (feature store, candidate generator, ranker, filter, experiment router), it embeds all logic in a single Go binary. This eliminates 4+ network hops, dropping p99 from ~57ms to ~15ms.
+
+**How it works:**
+
+The API exposes three endpoints:
+
+| Endpoint | Purpose | SLA |
+|----------|---------|-----|
+| `GET /api/v1/recommend` | Personalized recommendations | <100ms p99 |
+| `GET /api/v1/popular` | Global popular items (CDN-cacheable) | <5ms |
+| `GET /health` | DragonflyDB connectivity check | <2s |
+
+**Embedded components (no network calls between them):**
+
+```
+recommendation-api binary
+  ├── DragonflyStore         — cache reads/writes (rec, popular)
+  ├── BitmapChecker          — stock availability via bitmap
+  ├── SessionFeatureExtractor — session event reads from ZSET
+  ├── WeightedScorer         — session-aware score adjustment
+  ├── SessionReranker        — orchestrates extract → score → sort
+  ├── ProtectedRanker        — Triton gRPC + circuit breaker
+  ├── DegradationManager     — 4-level load shedding state machine
+  ├── ExperimentRouter       — FNV-1a consistent hashing for A/B
+  ├── TierRouter             — multi-tier cascade orchestrator
+  └── Prometheus metrics     — per-tier counters, histograms, gauges
+```
+
+**Degradation state machine** — the API never returns an empty response:
+
+```
+Normal    (load < 1.5x)  →  All tiers active
+Warning   (load ≥ 1.5x)  →  Tier 3 (GPU) disabled
+Critical  (load ≥ 2.0x)  →  Tier 2 + 3 disabled
+Emergency (load ≥ 3.0x)  →  CDN fallback only (popular items)
+```
+
+**Production scale:** 250 pods, 4 CPU / 8GB each. HPA scales to 1,000 at peak. Each pod handles ~1,050 RPS (verified by benchmark).
+
+---
+
+### Ranking Service / Triton — GPU Inference
+
+**Why it exists:** Cold-start users (no cached recommendations) need real-time personalization. The DCN-V2 model scores candidate items based on user/item embeddings and context features. Triton's dynamic batching groups individual requests into GPU batches for efficient utilization.
+
+**How it works:**
+
+```
+ProtectedRanker.Rank(userID, candidates)
+        │
+        ▼
+  CircuitBreaker.Allow()?
+  ├── Open (5+ failures in 30s) → return error immediately
+  └── Closed/HalfOpen → proceed
+        │
+        ▼
+  Build BatchItem[]
+  ├── UserEmbedding:   128-dim (from feature store)
+  ├── ItemEmbedding:   128-dim (from feature store)
+  └── ContextFeatures: 32-dim  (session context)
+        │
+        ▼
+  Triton gRPC: ModelInfer(dcn_v2, batch)
+  ├── Dynamic batching: 32/64/128 preferred batch sizes
+  ├── TensorRT INT8 quantization: 3x throughput vs FP32
+  └── Timeout: 80ms (context deadline)
+        │
+        ▼
+  Sort candidates by score descending
+  Return ranked list
+```
+
+**Circuit breaker states:**
+- **Closed** (normal): all requests pass through. Failures increment counter
+- **Open** (after 5 failures): all requests immediately rejected with error. Timer starts (30s)
+- **Half-Open** (after 30s): one request allowed through. Success → Closed. Failure → Open
+
+**Why only 0.9% of traffic reaches Tier 3:** The 3-tier strategy pre-computes recommendations for 85% of users (Tier 1 cache hit). Session re-ranking handles 12%. Only cold-start/experiment users hit GPU inference. This reduces GPU cost from $60K/mo (all-GPU) to $4.8K/mo.
+
+**Production scale:** 8 pods, 4 CPU / 16GB + 1x NVIDIA L4 GPU each. HPA scales to 32 pods.
+
+---
+
+### Batch Processor — Offline Intelligence (PySpark + Airflow)
+
+**Why it exists:** Training ML models and pre-computing recommendations for 50M users can't happen in real-time. The batch processor runs on cheap spot instances during off-peak hours, computing features that would be too expensive to calculate per-request.
+
+**How it works — four stages:**
+
+```
+Stage 1: Feature Engineering (PySpark)
+──────────────────────────────────────
+Raw events (PostgreSQL/MinIO)
+  ↓ groupBy(user_id)
+  ├── total_clicks, total_views, total_purchases
+  ├── category_interests (set of interacted categories)
+  └── total_events
+  ↓ groupBy(item_id)
+  ├── click_count, purchase_count
+  ├── ctr = clicks / max(views, 1)
+  └── unique_users
+
+Stage 2: Model Training (PyTorch + DeepSpeed)
+──────────────────────────────────────────────
+Features + labels → Two-Tower model training
+  ├── User tower: user_id(64d) + categories(32d) → MLP → 128d embedding
+  └── Item tower: item_id(64d) + category(32d) + price(32d) → MLP → 128d embedding
+Features + labels → DCN-V2 model training
+  └── user_emb(128d) + item_emb(128d) + context(32d) → cross network → score
+
+Stage 3: Embedding & Indexing
+─────────────────────────────
+Item tower → batch generate item embeddings
+  ↓ bulk insert
+Milvus ANN index (item_embeddings collection, 128-dim, HNSW)
+
+Stage 4: Pre-compute Recommendations
+─────────────────────────────────────
+For each user (batched, 1000 users/batch):
+  user_embedding → Milvus.search(top_k=100)
+  ↓ results
+  DragonflyDB: SET rec:{user_id}:top_k {json} EX 86400
+```
+
+**Scheduling (Airflow):**
+- **Daily full pipeline**: All 4 stages. Runs at 3 AM when traffic is lowest
+- **4-hour incremental**: Stage 1 (recent events only) + Stage 4 (updated users only)
+
+**Production scale:** Spark on spot instances (60% cost reduction). Airflow on minimal always-on nodes.
+
+---
+
+### PostgreSQL — Metadata Store
+
+**Why it exists:** Relational data (item catalog, user profiles, experiment history) needs ACID transactions and complex queries that DragonflyDB can't provide. PostgreSQL is the source of truth; DragonflyDB is the serving cache.
+
+**Current usage:**
+- Airflow metadata database (DAG runs, task states, connections)
+- Planned: item catalog (name, description, price, category, images), user metadata, experiment results
+
+**How it fits:**
+
+```
+PostgreSQL (source of truth)
+  ├── items table: id, name, category, price, image_url, created_at
+  ├── users table: id, preferences, signup_date
+  └── experiments table: id, config, results, created_at
+       │
+       ├──→ (CDC or batch ETL) → DragonflyDB (serving cache)
+       └──→ (direct queries) → Admin dashboards, analytics
+```
+
+**Production scale:** HA cluster with streaming replication. Not on the hot serving path.
+
+---
+
+### MinIO — Object Storage
+
+**Why it exists:** Event logs, model artifacts, and training data need durable, cheap storage. MinIO provides S3-compatible object storage that can run anywhere — on-premises or cloud — without vendor lock-in.
+
+**What it stores:**
+- Raw event logs (archived from Redpanda)
+- Model checkpoints (PyTorch .pt files)
+- ONNX exported models (for Triton deployment)
+- Training datasets (feature matrices)
+- Spark intermediate data
+
+**Production scale:** Distributed mode with erasure coding for durability.
+
+---
+
+### Monitoring Stack — Observability Layer
+
+**Why it exists:** At 50M DAU, you can't debug by reading logs. The monitoring stack provides real-time visibility into every component's health, with automated alerts that trigger the degradation state machine.
+
+**Components and roles:**
+
+```
+┌─ Prometheus ───────────────────────────────────────────────┐
+│  Scrapes metrics every 15s from:                            │
+│  ├── event-collector:2112  (requests, errors, latency)     │
+│  ├── recommendation-api:2112 (per-tier metrics, CB state)  │
+│  ├── redpanda:9644 (partition lag, broker health)          │
+│  └── dragonfly:6380 (memory, eviction, cmd latency)        │
+│  Stores: 7-day TSDB retention                               │
+└─────────────────────┬──────────────────────────────────────┘
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+┌─ Grafana ──┐ ┌─ Alertmanager ┐ ┌─ Jaeger ────────────┐
+│ Dashboards │ │ Alert routing │ │ Distributed tracing │
+│ Per-tier   │ │ PagerDuty/    │ │ OTLP collector      │
+│ latency,   │ │ Slack/Email   │ │ Request waterfall   │
+│ throughput │ │ integration   │ │ across services     │
+└────────────┘ └───────────────┘ └─────────────────────┘
+```
+
+**Custom metrics exposed by recommendation-api:**
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `recsys_requests_total` | Counter | tier | Track traffic distribution across tiers |
+| `recsys_request_duration_seconds` | Histogram | tier | Latency by tier (buckets: 1/5/10/20/50/100ms) |
+| `recsys_errors_total` | Counter | tier | Error rate by tier |
+| `recsys_circuit_breaker_state` | Gauge | tier | 0=closed, 1=open, 2=half-open |
+
+---
+
+### End-to-End Data Flow
+
+How a single user interaction travels through the entire system:
+
+```
+1. User clicks item on app
+        │
+        ▼
+2. POST /api/v1/events → Envoy → Event Collector
+   Validates, assigns event_id, publishes to Redpanda
+        │
+        ▼
+3. Redpanda: user-events topic (partition key = user_id)
+        │
+        ├──────────────────────────────┐
+        ▼                              ▼
+4. Flink Stream Processor          5. MinIO (archive)
+   ├── clicks_1h counter update        │
+   ├── session event append            ▼
+   └── (if stock event)            6. Spark Batch (daily)
+       bitmap update                   ├── feature engineering
+        │                              ├── model training
+        ▼                              ├── embedding generation
+   DragonflyDB (features)             └── pre-compute recs
+                                           │
+                                           ▼
+                                       DragonflyDB (recs)
+                                       Milvus (ANN index)
+                                           │
+7. User requests recommendations           │
+        │                                  │
+        ▼                                  │
+8. GET /api/v1/recommend → Envoy → Recommendation API
+   ├── Read cached recs from DragonflyDB ←─┘
+   ├── Filter out-of-stock (bitmap)
+   ├── Re-rank with session context (ZSET)
+   ├── (optional) Triton GPU inference
+   └── Return personalized list
+        │
+        ▼
+9. User sees recommendations, clicks another item → back to step 1
+```
+
+---
+
 ## 3-Tier Serving Strategy
 
 The core insight: **don't run GPU inference on every request.** Pre-compute results for most users, reserve real-time inference for cache misses only.
