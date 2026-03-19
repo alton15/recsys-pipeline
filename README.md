@@ -8,18 +8,141 @@ A cloud-agnostic reference architecture that runs locally with `docker-compose u
 
 ---
 
+## What This Project Does
+
+This is a **personalized product recommendation system** for large-scale e-commerce. When a user opens the app, this system decides which products to show — tailored to their browsing history, purchase patterns, and real-time session behavior.
+
+### The Problem It Solves
+
+A user opens a commerce app. The app has 1 million products. Showing random products means the user leaves. Showing the same "Top 10" to everyone is slightly better, but 50 million users have 50 million different tastes. The system must answer:
+
+> **"Which 20 products, out of 1 million, should this specific user see right now?"**
+
+...and answer it in under 100ms, 500,000 times per second, without going bankrupt on GPU costs.
+
+### How It Recommends
+
+The system uses a **3-stage approach** inspired by production systems at companies like YouTube, Pinterest, and Alibaba:
+
+```
+Stage 1: Candidate Generation (offline, batch)
+──────────────────────────────────────────────
+  "From 1M products, narrow down to 100 candidates for this user"
+
+  Two-Tower neural network learns user and item embeddings (128-dim vectors).
+  User's embedding is compared against all item embeddings via ANN search (Milvus).
+  Result: top 100 most relevant items per user, pre-computed every 4 hours.
+
+Stage 2: Re-ranking (online, real-time)
+───────────────────────────────────────
+  "From 100 candidates, re-order based on what this user just did"
+
+  Session events (last 50 clicks/views) adjust item scores:
+  - Items already clicked: penalized (don't show the same thing again)
+  - Items already viewed: mildly penalized
+  - Items from diverse categories: boosted
+  Result: context-aware ordering that adapts within the session.
+
+Stage 3: Scoring (online, GPU inference — cold-start only)
+──────────────────────────────────────────────────────────
+  "For new users with no history, score candidates using the ranking model"
+
+  DCN-V2 (Deep & Cross Network v2) scores each candidate using:
+  - User embedding (128-dim)
+  - Item embedding (128-dim)
+  - Context features (32-dim: device, time, session length)
+  Result: ML-ranked list for users the system knows nothing about.
+```
+
+### What Makes This Different
+
+Most recommendation system tutorials show you **one piece** — a collaborative filtering model in a Jupyter notebook, or a REST API that returns hardcoded items. This project is the **entire machine**:
+
+| Layer | What's Included | What Most Demos Skip |
+|-------|----------------|---------------------|
+| **Event ingestion** | HTTP collector → Redpanda (Kafka-compatible) | Event schema, partitioning, backpressure |
+| **Stream processing** | Flink jobs for real-time features | Session tracking, sliding windows, stock bitmap |
+| **Batch pipeline** | PySpark features + Airflow scheduling | Feature engineering at scale, incremental refresh |
+| **ML models** | Two-Tower retrieval + DCN-V2 ranking (PyTorch) | Training pipeline, ONNX export, embedding generation |
+| **Vector search** | Milvus ANN index for candidate retrieval | Index building, batch pre-computation |
+| **Serving API** | Multi-tier Go API with embedded logic | Graceful degradation, circuit breakers, A/B testing |
+| **GPU inference** | Triton Inference Server (gRPC) | Dynamic batching, INT8 quantization, timeout handling |
+| **Inventory filtering** | Real-time stock bitmap (O(1) per item) | Never recommend out-of-stock products |
+| **Experiment routing** | FNV-1a consistent hashing for A/B tests | Deterministic bucket assignment, traffic splitting |
+| **Infrastructure** | Docker Compose (local) + Helm (K8s production) | Envoy gateway, Prometheus/Grafana, chaos tests |
+
+### Who This Is For
+
+- **Backend/ML engineers** studying how recommendation systems work end-to-end at scale
+- **System architects** evaluating technology choices for real-time personalization
+- **Engineering teams** looking for a reference architecture to adapt for their own commerce platform
+- **Interview candidates** who want to demonstrate deep understanding of ML infrastructure beyond "I trained a model in a notebook"
+
+This is **not** a drag-and-drop SaaS product. It's a reference implementation — meant to be studied, forked, and adapted.
+
+---
+
 ## Why This Project?
 
 Building a personalization engine for tens of millions of users is one of the hardest engineering challenges in commerce. Most open-source examples are either toy demos or proprietary fragments. This project provides a **complete, runnable pipeline** — from event ingestion to model serving — designed to handle real production traffic.
+
+### The Core Design Philosophy
+
+**1. Pre-compute everything possible, compute on-demand only when necessary.**
+
+At 500K RPS, running a neural network on every request would require 500+ GPUs ($300K+/mo). Instead, the system pre-computes recommendations for 85% of users offline, serves them from cache in 3-5ms, and reserves GPU inference for the 0.9% of requests that truly need it (cold-start users, A/B test variants).
+
+**2. Degrade gracefully, never fail silently.**
+
+The system has 4 degradation levels. Under extreme load, it progressively disables expensive tiers (GPU → session re-ranking → cache) but always returns something — even if it's just a global popular items list. No user ever sees an empty screen.
+
+**3. Embed, don't fan-out.**
+
+Traditional microservice architectures fan out to 5+ services per request (feature store, candidate generator, ranker, filter, experiment router), adding 10+ network hops. This project embeds all serving logic in a single Go binary, reducing p99 from ~57ms to ~15ms.
 
 **Key numbers at 50M DAU:**
 
 | Metric | Value |
 |--------|-------|
-| Peak RPS | 500K |
-| p99 Latency | < 100ms (Tier 1: < 5ms) |
-| GPU Inference RPS | ~4.5K (0.9% of traffic) |
-| Estimated Monthly Cost | ~$84K (~1.18억 원) |
+| Peak RPS | 500K (70% absorbed by CDN, 150K hits backend) |
+| p99 Latency | < 100ms all tiers, < 5ms for Tier 1 cache hits |
+| Cache Hit Rate | 85% of personalized requests served from pre-computed cache |
+| GPU Inference | ~4.5K RPS (0.9% of traffic), 8x NVIDIA L4 GPUs |
+| Estimated Monthly Cost | ~$84K (~1.18억 원), 71% cheaper than conventional architecture |
+| Items in Catalog | 1M products, 100K categories |
+| Recommendation Freshness | 4h incremental, 24h full recompute |
+
+### What It Looks Like in Practice
+
+```
+# 1. Start everything locally
+make up
+
+# 2. Seed 10,000 items and 1,000 users with realistic preferences
+make seed-data
+
+# 3. Generate traffic (clicks, views, purchases)
+make simulate-traffic
+
+# 4. Ask for recommendations
+curl "http://localhost:8090/api/v1/recommend?user_id=u_00001&session_id=sess_001&limit=5"
+
+# Response:
+{
+  "items": [
+    {"item_id": "i_004217", "score": 0.97, "category": "electronics"},
+    {"item_id": "i_001832", "score": 0.94, "category": "electronics"},
+    {"item_id": "i_007291", "score": 0.91, "category": "gaming"},
+    {"item_id": "i_000482", "score": 0.88, "category": "electronics"},
+    {"item_id": "i_003119", "score": 0.85, "category": "audio"}
+  ],
+  "tier": "tier2_rerank",
+  "experiment_id": "exp_v2",
+  "model_version": "dcn_v2_20240315"
+}
+```
+
+The response tells you: these 5 items were retrieved from the user's pre-computed cache (Tier 1), re-ranked using their session behavior (Tier 2), and the user is in experiment group `exp_v2`.
 
 ---
 
