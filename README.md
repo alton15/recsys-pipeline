@@ -934,6 +934,336 @@ The system never shows an empty screen. Each degradation level sheds the most ex
 
 ---
 
+## Architectural Considerations
+
+Design decisions that are only visible in the implementation. Each one answers a "why is it done this way?" question.
+
+### 1. CDN for API Responses, Not Just Static Files
+
+CDN (Tier 0) caches **API responses**, not images or JS bundles. The `/api/v1/popular` endpoint returns identical JSON for all users, with cache headers:
+
+```
+Cache-Control: public, max-age=30, stale-while-revalidate=60
+```
+
+This absorbs 70% of total traffic (350K RPS) at the edge before it reaches any backend. Without it, the recommendation-api would need 475 instances instead of 143. Modern CDNs (Cloudflare, CloudFront, Fastly) natively support API response caching — CDN is no longer just for static files.
+
+**When CDN caching applies:** response is identical for all users + short TTL is acceptable + no authentication required.
+
+### 2. Timeout Budget Strategy
+
+Every timeout is chosen to fit within the tier's SLA budget:
+
+```
+Tier 1 SLA: < 20ms
+├── DragonflyDB read timeout:     10ms  (leaves 10ms for HTTP overhead)
+├── Stock bitmap (2 pipelines):   10ms  (parallel to cache read)
+└── HTTP server read timeout:      5s   (outer safety net)
+
+Tier 3 SLA: < 100ms
+├── Triton inference timeout:     80ms  (leaves 20ms for network + serialize)
+├── Circuit breaker check:        ~0μs  (atomic operation, no I/O)
+└── Envoy route timeout:           5s   (outer safety net)
+```
+
+**Why 10ms for DragonflyDB:** At p99, DragonflyDB responds in <1ms locally and <5ms in production. The 10ms timeout catches the rare tail latency spike without triggering false cache misses. If DragonflyDB is consistently above 10ms, something is fundamentally wrong and the system should degrade.
+
+**Why 80ms for Triton:** DCN-V2 inference with INT8 quantization completes in ~15ms on L4 GPU. The remaining 65ms covers network transfer, dynamic batching wait, and serialization. Setting it tighter risks premature circuit breaker trips during normal batch accumulation.
+
+### 3. Connection Pool Sizing
+
+```
+recommendation-api instance:
+  ├── DragonflyStore pool:    100 connections (recommendation reads)
+  ├── Reranker pool:          100 connections (session event reads)
+  ├── Stock pool:             100 connections (bitmap operations)
+  └── Total per instance:     300 connections
+
+At 250 instances = 75,000 total DragonflyDB connections
+DragonflyDB 10-node cluster capacity: ~100,000 connections
+Utilization: ~75%
+```
+
+**Why 100 per pool:** Each recommendation request makes 1-3 DragonflyDB calls (cache read + stock filter + session read). At 1,050 RPS per instance with ~10ms per call, that's ~10 concurrent connections. Pool size 100 provides 10x headroom for burst traffic and slow queries.
+
+**Why 3 separate pools:** Isolates failure domains. If session reads are slow (Tier 2), stock reads (critical for all tiers) still have dedicated connections. A single shared pool would let one slow operation starve others.
+
+### 4. Partition Key Strategy
+
+```
+Topic: user-events     → Partition key: user_id
+Topic: inventory-events → Partition key: item_id
+```
+
+**Why user_id for events:** Guarantees per-user event ordering. A user's click → view → purchase sequence is never reordered within a partition. This is critical for:
+- Session event reconstruction (ZSET must reflect real chronological order)
+- Click window aggregation (1-hour sliding window assumes ordered input)
+- Feature computation (recent_items list depends on insertion order)
+
+**Why item_id for inventory:** Stock updates for the same item must be ordered. If item_042 goes out-of-stock then back in-stock, the bitmap must reflect the final state. Without ordering, a late-arriving "out-of-stock" could overwrite a newer "in-stock" update.
+
+**Tradeoff:** Per-user ordering means no global ordering across users. Two users' events may be processed in any interleaved order. This is acceptable because features are per-user, not global.
+
+### 5. Failure Mode Analysis
+
+What happens when each component fails:
+
+```
+┌─────────────────────┬──────────────────────────────────────────────────────┐
+│ Component Failure    │ System Behavior                                     │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ DragonflyDB down    │ Health check fails → HTTP 503                       │
+│                     │ All tiers fail → Emergency degradation              │
+│                     │ CDN serves cached /popular responses (30s stale)    │
+│                     │ Recovery: automatic on DragonflyDB restart          │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ Triton down         │ ScoreBatch returns error → circuit breaker opens    │
+│                     │ Tier 3 disabled, Tier 1+2 unaffected               │
+│                     │ Cold-start users see popular items (fallback)       │
+│                     │ Recovery: breaker half-opens after 30s, probes      │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ Redpanda down       │ Event collector publish fails → events dropped      │
+│                     │ Recommendation serving unaffected (reads DragonflyDB│
+│                     │ Features become stale (no new click counts)         │
+│                     │ Recovery: events lost during outage, features       │
+│                     │ self-correct on next sliding window cycle           │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ Flink down          │ No real-time feature updates                        │
+│                     │ Session events not written → Tier 2 reranking       │
+│                     │ uses stale session data (or empty)                  │
+│                     │ Stock bitmap not updated → stale inventory          │
+│                     │ Recovery: Flink resumes from checkpoint, replays    │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ Milvus down         │ No impact on serving (pre-computed recs in cache)   │
+│                     │ Batch pipeline fails → no new pre-computations      │
+│                     │ Existing recs served until TTL expiry               │
+│                     │ Recovery: batch pipeline retries on next schedule   │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ Single Rec-API pod  │ Envoy routes to healthy pods (round-robin)          │
+│                     │ PDB ensures min 200/250 pods during rolling update  │
+│                     │ No user-visible impact                              │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ Envoy down          │ Total service outage (single point of ingress)      │
+│                     │ Mitigated by: 10 Envoy pods + K8s Service LB       │
+│                     │ CDN continues serving cached /popular               │
+└─────────────────────┴──────────────────────────────────────────────────────┘
+```
+
+**Key insight:** The only true SPOF is DragonflyDB (serves all tiers). Triton, Flink, Milvus, and Redpanda can all fail without losing serving capability — quality degrades, but the system stays up.
+
+### 6. Data Consistency Model
+
+The system is **eventually consistent by design**. No component guarantees strong consistency:
+
+| Data | Consistency Window | Why Acceptable |
+|------|-------------------|----------------|
+| Pre-computed recs | 4h-7d stale | Users don't notice if recommendations shift by hours |
+| Session events | ~1s (Flink latency) | Re-ranking delay of 1s is imperceptible |
+| Stock bitmap | ~1s (Flink latency) | 1s stale stock = rare out-of-stock recommendation |
+| Click counts (clicks_1h) | ~1min (window slide) | Feature freshness of 1 min is sufficient for scoring |
+| Experiment config | Immediate (read on request) | Config reads are uncached, always fresh |
+
+**Where eventual consistency hurts:**
+- A user purchases an item → Flink updates session → next recommendation still shows it (1s window)
+- Item goes out of stock → bitmap updates in ~1s → during that 1s, users may see it recommended
+- Solution: both cases are acceptable in commerce (order validation catches true stock issues)
+
+**Where strong consistency is needed (and provided):**
+- Experiment assignment: FNV-1a hash is deterministic — same user always gets same bucket, no inconsistency possible
+- Circuit breaker state: atomic operations, single-instance scope, no distributed coordination needed
+
+### 7. Cold Start Handling
+
+When a brand-new user makes their first recommendation request:
+
+```
+1. GET rec:{new_user}:top_k  →  MISS (no pre-computed recs)
+2. Fallback: popular items loaded
+3. Stock filter applied
+4. Session reranking: SKIP (no session history)
+5. Tier 3 (if available): Triton scores popular items for this user
+   └── Uses zero-vector embeddings (no user profile yet)
+   └── Effectively random re-ordering of popular items
+6. Result: popular items, possibly reordered by model
+```
+
+**Current limitation:** No explicit cold-start mitigation. New users get popular items until:
+- They generate enough events for session-aware reranking (Tier 2)
+- The next batch pipeline computes their personalized recs (Tier 1, 4h-24h delay)
+
+**Production improvement path:**
+- Use demographic/contextual signals (device, location, time) for initial Tier 3 scoring
+- Implement real-time embedding updates via Flink (update user embedding as events arrive)
+- Serve category-specific popular items based on entry page context
+
+### 8. Cache Invalidation Strategy
+
+The system uses **TTL-based expiration only** — no explicit invalidation:
+
+```
+rec:{user_id}:top_k       → TTL 7 days (set by batch pipeline)
+                             Overwritten every 4h by incremental recompute
+                             No explicit DELETE on user behavior change
+
+feat:user:{uid}:clicks_1h → TTL 3660s (set by Flink)
+                             Self-correcting: window slides, old counts drop off
+
+session:{sid}:events       → No TTL (accumulates indefinitely)
+                             Should have 24h TTL (current gap)
+
+stock:bitmap               → No TTL (bitmap bits flipped in-place)
+                             Self-correcting: each stock event updates the bit
+```
+
+**Why no explicit invalidation:** At 50M DAU, invalidating all affected caches on every user action would generate millions of DELETE operations per second. TTL-based expiration is cheaper and "good enough" — recommendations don't need to be real-time, and the 4-hour incremental pipeline catches up.
+
+**When explicit invalidation would be needed:**
+- Price changes that affect ranking (rare, handled by batch pipeline)
+- Item takedowns (legal/compliance) — would need a dedicated invalidation path
+- Experiment config changes — already reads uncached
+
+### 9. Backpressure Handling
+
+How each component handles being overwhelmed:
+
+| Layer | Backpressure Mechanism | Behavior When Saturated |
+|-------|----------------------|-------------------------|
+| **Envoy** | Token bucket rate limiter | Excess requests get HTTP 429 |
+| **Event Collector** | Go HTTP server read timeout (5s) | Slow clients disconnected |
+| **Redpanda Producer** | Batch buffer (1MB max, 5ms linger) | Blocks when buffer full |
+| **Flink** | Checkpoint-based backpressure | Slows consumption from Redpanda |
+| **DragonflyDB** | Connection pool (100 per client) | New requests wait for free connection |
+| **Recommendation API** | Degradation state machine | Sheds tiers as load increases |
+| **Triton** | Circuit breaker (5 failures) | All Tier 3 requests rejected immediately |
+
+**End-to-end backpressure chain:**
+```
+Traffic spike → Envoy rate limits excess
+  → Surviving requests hit Rec API → degradation escalates
+    → Tier 3 disabled (Warning) → Tier 2 disabled (Critical)
+      → Only cache reads (fast, low load) → system stabilizes
+```
+
+### 10. Memory Budget Calculation
+
+```
+DragonflyDB cluster memory budget (10 nodes × 64GB = 640GB total):
+
+Pre-computed recommendations:
+  50M users × ~1KB JSON per user (100 items) = ~50GB
+
+Real-time features:
+  10M active users × ~100 bytes per feature key × 5 keys = ~5GB
+
+Session events:
+  5M concurrent sessions × ~2KB average (50 events × 40 bytes) = ~10GB
+
+Stock bitmap + offset map:
+  1M items × 1 bit (bitmap) = 125KB
+  1M items × ~20 bytes (id_map key+value) = ~20MB
+
+Popular items + experiment configs:
+  ~100KB (negligible)
+
+Total required:   ~65GB
+Total available:  640GB
+Utilization:      ~10%
+Safety margin:    ~90% (for replication, fragmentation, OS overhead)
+```
+
+**Why 10 nodes seems over-provisioned:** DragonflyDB's Dash hash table has ~30% fragmentation overhead. With replication factor 2 for HA, actual usable memory is ~220GB. Add 20% for spikes and background operations → 65GB / 176GB ≈ 37% utilization. Healthy range.
+
+### 11. Ordering & Idempotency Guarantees
+
+| Operation | Ordered? | Idempotent? | Risk on Retry |
+|-----------|----------|-------------|---------------|
+| Event publish to Redpanda | Per-user (partition key) | No (duplicate events possible) | Double-counted clicks |
+| Flink click aggregation | Per-window | No (counter increment) | Inflated click_1h count |
+| Flink session ZADD | Per-session (timestamp score) | Yes (same score = no-op) | None |
+| Flink stock SETBIT | Per-item | Yes (bit flip is idempotent) | None |
+| Batch pre-compute SET | Per-user | Yes (overwrites previous) | None |
+| DragonflyDB read | N/A | N/A | N/A |
+
+**Where idempotency gaps exist:**
+- Event collector has no deduplication ID. If a client retries a failed POST, the event is published twice
+- Flink click counter uses simple increment — replayed events inflate counts
+- **Mitigation:** These are acceptable for recommendation features. A click count of 51 vs 50 doesn't meaningfully change recommendation quality. For revenue-critical metrics (purchases), deduplication should be added at the event collector level
+
+### 12. Security Considerations
+
+| Layer | Measure | Current Status |
+|-------|---------|---------------|
+| **Envoy** | Rate limiting (10K tokens/sec) | Implemented |
+| **Envoy** | Authentication/authorization | Not implemented (no auth header check) |
+| **Event Collector** | Input validation (event_type, user_id, item_id) | Implemented |
+| **Event Collector** | Request size limit | Go default (10MB) |
+| **DragonflyDB** | Authentication (requirepass) | Not configured |
+| **Redpanda** | SASL/TLS | Not configured (dev mode) |
+| **PostgreSQL** | Password auth | Configured (recsys/recsys) |
+| **Triton** | gRPC auth | Not configured |
+| **Network** | Service mesh / mTLS | Not implemented |
+
+**Production hardening needed:**
+- Enable DragonflyDB `requirepass` and Redpanda SASL/TLS
+- Add JWT/API key validation at Envoy level
+- Implement network policies in K8s (pod-to-pod isolation)
+- Use Kubernetes secrets for all credentials (not env vars in docker-compose)
+- Add request size limits to prevent payload-based DoS
+
+### 13. Graceful Shutdown & Zero-Downtime Deploys
+
+Both Go services implement graceful shutdown:
+
+```go
+// Signal handling
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+<-quit
+
+// Graceful shutdown with 10s deadline
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+appServer.Shutdown(ctx)     // stops accepting new connections
+metricsServer.Shutdown(ctx) // stops metrics endpoint
+```
+
+**Kubernetes rolling update flow:**
+1. Pod receives SIGTERM
+2. Readiness probe starts failing → removed from Service endpoints
+3. In-flight requests complete (up to 10s)
+4. Connections drain, DragonflyDB/Redpanda clients close
+5. Pod terminates
+
+**PDB ensures availability during deploys:**
+- event-collector: minAvailable 40/50 (80%)
+- recommendation-api: minAvailable 200/250 (80%)
+- ranking-service: minAvailable 6/8 (75%)
+
+### 14. Observability-Driven Degradation
+
+The degradation state machine and monitoring are designed to work together:
+
+```
+Prometheus scrapes recsys_request_duration_seconds every 15s
+  → Grafana dashboard shows per-tier latency spike
+    → Alertmanager fires alert when p99 > threshold
+      → (Manual or automated) DegradationManager.ReportLoad(ratio)
+        → System sheds tiers based on load ratio
+
+Prometheus scrapes recsys_circuit_breaker_state every 15s
+  → Grafana shows Triton circuit breaker open
+    → Alertmanager fires "Tier 3 unavailable" alert
+      → On-call investigates GPU health
+```
+
+**Key alert rules (planned):**
+- p99 > 100ms for 5 minutes → Warning
+- Error rate > 1% for 2 minutes → Critical
+- Circuit breaker open for > 5 minutes → Critical
+- DragonflyDB memory > 80% → Warning
+- Redpanda consumer lag > 10,000 → Warning
+
+---
+
 ## Recommendation Strategy Deep Dive
 
 ### How Recommendations Are Served
