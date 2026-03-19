@@ -204,7 +204,7 @@ func TestClient_Score_InvalidDimensions(t *testing.T) {
 
 func TestClient_ScoreBatch_MultipleItems(t *testing.T) {
 	mock := &mockGRPCInferenceClient{
-		result: mockInferResult{scores: []float32{0.9}},
+		result: mockInferResult{scores: []float32{0.9, 0.7}},
 	}
 
 	c := NewClient(mock, 100*time.Millisecond)
@@ -228,6 +228,73 @@ func TestClient_ScoreBatch_MultipleItems(t *testing.T) {
 	}
 	if len(scores) != 2 {
 		t.Errorf("expected 2 scores, got %d", len(scores))
+	}
+	if scores[0] != 0.9 {
+		t.Errorf("expected first score 0.9, got %f", scores[0])
+	}
+	if scores[1] != 0.7 {
+		t.Errorf("expected second score 0.7, got %f", scores[1])
+	}
+}
+
+func TestClient_ScoreBatch_BatchedRequest(t *testing.T) {
+	// Verify that ScoreBatch sends a single batched request, not per-item calls.
+	callCount := 0
+	mock := &mockGRPCInferenceClient{
+		result: mockInferResult{scores: []float32{0.8, 0.6, 0.4}},
+		reqCheck: func(req *InferRequest) {
+			callCount++
+			// The batched request should contain concatenated embeddings.
+			if len(req.UserEmbedding) != 3*UserEmbeddingDim {
+				t.Errorf("expected batched user embedding len %d, got %d", 3*UserEmbeddingDim, len(req.UserEmbedding))
+			}
+			if len(req.ItemEmbedding) != 3*ItemEmbeddingDim {
+				t.Errorf("expected batched item embedding len %d, got %d", 3*ItemEmbeddingDim, len(req.ItemEmbedding))
+			}
+		},
+	}
+
+	c := NewClient(mock, 100*time.Millisecond)
+
+	items := make([]BatchItem, 3)
+	for i := range items {
+		items[i] = BatchItem{
+			UserEmbedding:   make([]float32, UserEmbeddingDim),
+			ItemEmbedding:   make([]float32, ItemEmbeddingDim),
+			ContextFeatures: make([]float32, ContextFeatureDim),
+		}
+	}
+
+	scores, err := c.ScoreBatch(context.Background(), items)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(scores) != 3 {
+		t.Errorf("expected 3 scores, got %d", len(scores))
+	}
+	if callCount != 1 {
+		t.Errorf("expected exactly 1 gRPC call for batched inference, got %d", callCount)
+	}
+}
+
+func TestClient_ScoreBatch_InvalidDimensions(t *testing.T) {
+	mock := &mockGRPCInferenceClient{
+		result: mockInferResult{scores: []float32{0.5}},
+	}
+
+	c := NewClient(mock, 100*time.Millisecond)
+
+	items := []BatchItem{
+		{
+			UserEmbedding:   make([]float32, 64), // wrong dimension
+			ItemEmbedding:   make([]float32, ItemEmbeddingDim),
+			ContextFeatures: make([]float32, ContextFeatureDim),
+		},
+	}
+
+	_, err := c.ScoreBatch(context.Background(), items)
+	if err == nil {
+		t.Fatal("expected validation error for wrong dimensions in batch")
 	}
 }
 

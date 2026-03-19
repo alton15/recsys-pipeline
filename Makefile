@@ -1,4 +1,4 @@
-.PHONY: up down seed-data health-check simulate-traffic bench-local test verify-e2e lint
+.PHONY: up down logs seed-data simulate-traffic health-check verify-e2e test bench-local docker-build-all docker-push-all
 
 COMPOSE_FILE := infra/docker-compose.yml
 

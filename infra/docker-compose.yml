@@ -377,6 +377,7 @@ services:
     image: nvcr.io/nvidia/tritonserver:24.10-py3
     container_name: triton
     ports:
+      - "8000:8000"
       - "8001:8001"
       - "8002:8002"
     volumes:
@@ -388,5 +389,70 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    networks:
+      - recsys
+
+  # ──────────────────────────────────────────────
+  # Event Collector — HTTP → Redpanda ingestion
+  # ──────────────────────────────────────────────
+  event-collector:
+    build:
+      context: ../services/event-collector
+      dockerfile: ../../infra/docker/event-collector.Dockerfile
+    ports:
+      - "8080:8080"
+      - "2112:2112"
+    environment:
+      - REDPANDA_BROKERS=redpanda:9092
+      - METRICS_PORT=2112
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - recsys
+
+  # ──────────────────────────────────────────────
+  # Recommendation API — 3-tier serving
+  # ──────────────────────────────────────────────
+  recommendation-api:
+    build:
+      context: ../services/recommendation-api
+      dockerfile: ../../infra/docker/recommendation-api.Dockerfile
+    ports:
+      - "8090:8090"
+      - "2113:2112"
+    environment:
+      - DRAGONFLY_ADDR=dragonfly:6379
+      - TRITON_ADDR=triton:8001
+      - METRICS_PORT=2112
+    depends_on:
+      dragonfly:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - recsys
+
+  # ──────────────────────────────────────────────
+  # Envoy — edge proxy & rate limiting
+  # ──────────────────────────────────────────────
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    ports:
+      - "10000:10000"
+      - "9901:9901"
+    volumes:
+      - ../infra/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      - event-collector
+      - recommendation-api
     networks:
       - recsys

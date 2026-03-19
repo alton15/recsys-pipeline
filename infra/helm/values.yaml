@@ -49,7 +49,7 @@ recommendationApi:
     pullPolicy: IfNotPresent
   service:
     type: ClusterIP
-    port: 8080
+    port: 8090
     grpcPort: 50051
   resources:
     requests:

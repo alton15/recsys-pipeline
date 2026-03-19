@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -27,6 +28,11 @@ type ExperimentAssigner interface {
 	GetExperiment(userID string) (*experiment.Experiment, error)
 }
 
+// HealthPinger checks the health of a backing store.
+type HealthPinger interface {
+	Ping(ctx context.Context) error
+}
+
 // RecommendResponse is the JSON envelope returned to clients.
 type RecommendResponse struct {
 	Items        []tier.Recommendation `json:"items"`
@@ -39,6 +45,7 @@ type RecommendResponse struct {
 type RecommendHandler struct {
 	recommender  Recommender
 	experimenter ExperimentAssigner
+	pinger       HealthPinger
 }
 
 // NewRecommendHandler creates a RecommendHandler with the given recommender.
@@ -51,6 +58,16 @@ func (h *RecommendHandler) WithExperiments(e ExperimentAssigner) *RecommendHandl
 	return &RecommendHandler{
 		recommender:  h.recommender,
 		experimenter: e,
+		pinger:       h.pinger,
+	}
+}
+
+// WithPinger returns a new RecommendHandler with a health pinger for dependency checks.
+func (h *RecommendHandler) WithPinger(p HealthPinger) *RecommendHandler {
+	return &RecommendHandler{
+		recommender:  h.recommender,
+		experimenter: h.experimenter,
+		pinger:       p,
 	}
 }
 
@@ -125,8 +142,35 @@ func (h *RecommendHandler) HandleRecommend(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(resp)
 }
 
-// HandleHealth returns a simple 200 OK for liveness probes.
-func (h *RecommendHandler) HandleHealth(w http.ResponseWriter, _ *http.Request) {
+// HealthResponse is the JSON body returned by the health endpoint.
+type HealthResponse struct {
+	Status    string `json:"status"`
+	Dragonfly string `json:"dragonfly"`
+}
+
+// HandleHealth checks DragonflyDB connectivity and returns the health status.
+// Returns 200 if healthy, 503 if DragonflyDB is unreachable.
+func (h *RecommendHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if h.pinger != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := h.pinger.Ping(ctx); err != nil {
+			log.Printf("health check failed: dragonfly ping error: %v", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(HealthResponse{
+				Status:    "unhealthy",
+				Dragonfly: "disconnected",
+			})
+			return
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	json.NewEncoder(w).Encode(HealthResponse{
+		Status:    "ok",
+		Dragonfly: "connected",
+	})
 }

@@ -1,7 +1,9 @@
 package handler_test
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -126,7 +128,7 @@ func TestHandleRecommend_MethodNotAllowed(t *testing.T) {
 	}
 }
 
-func TestHandleHealth(t *testing.T) {
+func TestHandleHealth_NoPinger(t *testing.T) {
 	h := handler.NewRecommendHandler(&mockRouter{})
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -137,7 +139,68 @@ func TestHandleHealth(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if w.Body.String() != "ok" {
-		t.Errorf("expected 'ok', got %q", w.Body.String())
+
+	var resp handler.HealthResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("expected status 'ok', got %q", resp.Status)
+	}
+	if resp.Dragonfly != "connected" {
+		t.Errorf("expected dragonfly 'connected', got %q", resp.Dragonfly)
+	}
+}
+
+type mockPinger struct {
+	err error
+}
+
+func (m *mockPinger) Ping(_ context.Context) error {
+	return m.err
+}
+
+func TestHandleHealth_PingerHealthy(t *testing.T) {
+	h := handler.NewRecommendHandler(&mockRouter{}).WithPinger(&mockPinger{})
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleHealth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp handler.HealthResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Errorf("expected status 'ok', got %q", resp.Status)
+	}
+}
+
+func TestHandleHealth_PingerUnhealthy(t *testing.T) {
+	h := handler.NewRecommendHandler(&mockRouter{}).WithPinger(&mockPinger{err: fmt.Errorf("connection refused")})
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleHealth(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", w.Code)
+	}
+
+	var resp handler.HealthResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "unhealthy" {
+		t.Errorf("expected status 'unhealthy', got %q", resp.Status)
+	}
+	if resp.Dragonfly != "disconnected" {
+		t.Errorf("expected dragonfly 'disconnected', got %q", resp.Dragonfly)
 	}
 }

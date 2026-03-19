@@ -53,6 +53,7 @@ build/
 .env
 .env.*
 !.env.example
+configs/local.env
 !configs/local.env.example
 
 # ──────────────────────────────────────────────

@@ -102,21 +102,65 @@ func (c *Client) Score(ctx context.Context, userEmb, itemEmb []float32, ctxFeat 
 }
 
 // ScoreBatch scores multiple items and returns their relevance scores.
-// Each item is scored individually via Score. Returns scores in the same order as input.
+// It concatenates all item embeddings into a single batched inference request
+// to Triton, avoiding per-item round-trips. Returns scores in the same order
+// as the input items.
+//
+// NOTE: This relies on the Triton model being configured to accept dynamic
+// batch sizes. The user embedding is tiled across the batch dimension, and
+// item embeddings + context features are concatenated along the batch axis.
 func (c *Client) ScoreBatch(ctx context.Context, items []BatchItem) ([]float32, error) {
 	if len(items) == 0 {
 		return []float32{}, nil
 	}
 
-	scores := make([]float32, len(items))
+	// Validate all items before building the batched request.
 	for i, item := range items {
-		score, err := c.Score(ctx, item.UserEmbedding, item.ItemEmbedding, item.ContextFeatures)
-		if err != nil {
+		if err := validateDimensions(item.UserEmbedding, item.ItemEmbedding, item.ContextFeatures); err != nil {
 			return nil, fmt.Errorf("batch item %d: %w", i, err)
 		}
-		scores[i] = score
 	}
 
+	// Build a single batched request by concatenating embeddings along the
+	// batch dimension. Triton's dynamic batching treats the flattened array
+	// as [batch_size, embedding_dim].
+	batchSize := len(items)
+	batchUserEmb := make([]float32, 0, batchSize*UserEmbeddingDim)
+	batchItemEmb := make([]float32, 0, batchSize*ItemEmbeddingDim)
+	batchCtxFeat := make([]float32, 0, batchSize*ContextFeatureDim)
+
+	for _, item := range items {
+		batchUserEmb = append(batchUserEmb, item.UserEmbedding...)
+		batchItemEmb = append(batchItemEmb, item.ItemEmbedding...)
+		batchCtxFeat = append(batchCtxFeat, item.ContextFeatures...)
+	}
+
+	inferCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	if err := inferCtx.Err(); err != nil {
+		return nil, fmt.Errorf("triton batch inference context error: %w", err)
+	}
+
+	req := &InferRequest{
+		ModelName:       ModelName,
+		UserEmbedding:   batchUserEmb,
+		ItemEmbedding:   batchItemEmb,
+		ContextFeatures: batchCtxFeat,
+	}
+
+	resp, err := c.grpc.ModelInfer(inferCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("triton batch inference failed: %w", err)
+	}
+
+	if len(resp.Scores) != batchSize {
+		return nil, fmt.Errorf("triton batch: expected %d scores, got %d", batchSize, len(resp.Scores))
+	}
+
+	// Return a copy to avoid aliasing the response slice.
+	scores := make([]float32, batchSize)
+	copy(scores, resp.Scores)
 	return scores, nil
 }
 

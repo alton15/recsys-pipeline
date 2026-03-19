@@ -118,6 +118,11 @@ func (s *DragonflyStore) ListActiveExperiments() ([]experiment.Experiment, error
 	return experiments, nil
 }
 
+// Ping checks connectivity to DragonflyDB.
+func (s *DragonflyStore) Ping(ctx context.Context) error {
+	return s.client.Ping(ctx).Err()
+}
+
 // Close shuts down the underlying Redis client.
 func (s *DragonflyStore) Close() error {
 	return s.client.Close()
