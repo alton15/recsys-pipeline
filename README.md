@@ -29,6 +29,8 @@ A cloud-agnostic reference architecture that runs locally with `docker-compose u
 - [Quick Start](#quick-start)
 - [Performance Verification Results](#performance-verification-results)
 - [Production Deployment](#production-deployment)
+- [Known Improvements & Production Gaps](#known-improvements--production-gaps)
+  - [CDN Layer](#1-cdn-layer-assumed-but-never-tested) · [Security](#2-security-not-production-ready) · [Observability](#3-observability-gaps-between-metrics-and-tracing) · [DragonflyDB SPOF](#4-dragonflydb-single-point-of-failure) · [Flink Ops Risk](#5-stream-processor-flink-operational-risk) · [Experiment Consistency](#6-experiment-router-consistency-issues) · [Triton Placeholder](#7-triton-integration-placeholder-implementation) · [CI/CD](#8-missing-cicd-pipeline) · [Config Validation](#9-configuration-validation) · [Stock Bitmap](#10-stock-bitmap-scalability-concern) · [Load Test Gaps](#11-load-testing-missing-scenarios) · [Batch Pipeline](#12-batch-processor-incomplete-pipeline) · [Priority Matrix](#summary-priority-matrix)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -1922,6 +1924,255 @@ make health-check-k8s
 | DragonflyDB | 10 nodes | 8 CPU, 64GB |
 | Redpanda | 12 brokers | 8 CPU, 32GB |
 | Milvus | 8 nodes | 8 CPU, 32GB |
+
+---
+
+## Known Improvements & Production Gaps
+
+This section documents architectural gaps, technology trade-offs, and concrete improvement areas identified through codebase review and load testing analysis. Each item includes the current state, why it matters, and a suggested direction.
+
+---
+
+### 1. CDN Layer: Assumed but Never Tested
+
+**Current state:** The architecture describes a "Tier 0 (CDN)" layer that pre-serves popular/trending lists at < 5ms. The `/api/v1/popular` endpoint sets `Cache-Control: public, max-age=30`, but:
+
+- No k6 test script ever calls `/api/v1/popular`
+- No test simulates CDN failure (all 50M DAU traffic hitting the backend directly)
+- Chaos test YAMLs (tc05) mention "Tier 0 absorbs overflow" without verification
+- The `tier-distribution.js` test tracks tier1/tier2/tier3 but not fallback_popular
+
+**Why it matters:** If CDN goes down during peak hours, the entire 50M DAU traffic hits the backend with zero absorption. The `max-age=30` means even a healthy CDN refetches every 30 seconds — during which all edge PoPs simultaneously hit origin.
+
+**Suggested improvements:**
+- `cdn-bypass-worst-case.js` has been added (load-tests/) to simulate this scenario
+- Consider raising `max-age` to 60-120s with `stale-while-revalidate: 300` for popular items
+- Add a local caching layer (in-process LRU) in the recommendation-api for `/api/v1/popular` to survive CDN outages
+- Test CDN PoP warm-up scenarios for multi-region deployments
+
+---
+
+### 2. Security: Not Production-Ready
+
+**Current state:** Multiple security gaps that would block any real deployment:
+
+| Gap | Location | Risk |
+|-----|----------|------|
+| Hardcoded credentials | `docker-compose.yml` (`minioadmin/minioadmin`) | Credential leak |
+| No TLS | All inter-service communication is plaintext | Data interception |
+| No API authentication | Event collector accepts any POST | Data poisoning |
+| No input size limits | Event handler validates fields but not payload size | DoS via large payloads |
+| Secrets in env vars | `configs/local.env.example` has DSN with password | Secret sprawl |
+
+**Suggested improvements:**
+- Externalize secrets to HashiCorp Vault or K8s Secrets with sealed-secrets
+- Add mTLS between services (Envoy already supports it, just not configured)
+- Add API key or JWT validation on event ingestion endpoints
+- Add `max_bytes` check on request body in event handler (e.g., 64KB limit)
+- Validate required secrets are present at startup with fail-fast behavior
+
+---
+
+### 3. Observability: Gaps Between Metrics and Tracing
+
+**Current state:**
+- Prometheus scrapes 4 targets with static config (no service discovery)
+- Jaeger is deployed but **not integrated** into any Go service — no spans are emitted
+- Logging uses `log.Printf` (unstructured) — impossible to correlate across services
+- Circuit breaker state gauge (`recsys_circuit_breaker_state`) is defined in metrics but never updated in the breaker code
+- Degradation level is not exported as a metric
+
+**Why it matters:** When the system degrades under load, operators have no way to correlate why — they see latency spike in Grafana but can't trace a specific request through event-collector → Redpanda → stream-processor → DragonflyDB → recommendation-api.
+
+**Suggested improvements:**
+- Integrate OpenTelemetry SDK into Go services (replace `log.Printf` with `slog` + OTLP exporter)
+- Wire circuit breaker state changes to the existing Prometheus gauge
+- Export degradation level as a Prometheus gauge (`recsys_degradation_level`)
+- Add Prometheus service discovery for K8s (already possible with Helm annotations)
+- Add request ID propagation (X-Request-Id) through Envoy → services
+
+---
+
+### 4. DragonflyDB: Single Point of Failure
+
+**Current state:**
+- Single DragonflyDB instance in docker-compose (2 proactor threads)
+- No replication, no persistence configured
+- Connection pool hardcoded to 100 connections, 10ms read/write timeout
+- All serving tiers depend on it: Tier 1 (cached recs), stock bitmap, experiment config, session events
+
+**Why it matters:** DragonflyDB failure = total service failure. Even with the fallback-to-popular path, `GetPopularItems()` also reads from DragonflyDB. If DragonflyDB is down, every tier returns an error.
+
+**Suggested improvements:**
+- Configure DragonflyDB replication (master-replica) in docker-compose
+- Add a local in-process cache for popular items (the most critical fallback path should not depend on a remote call)
+- Make connection pool size configurable via environment variable
+- Consider a secondary store (e.g., embedded SQLite or static file) for the popular items fallback — this is the "last resort" and should survive any infrastructure failure
+- Chaos test `tc01-dragonfly-failure.yaml` exists but the expected "failover < 3s" is impossible without replication configured
+
+---
+
+### 5. Stream Processor (Flink): Operational Risk
+
+**Current state:**
+- Kotlin + Flink 1.20.0 with Kafka connector
+- No state backend configured — defaults to in-memory (HashMapStateBackend)
+- Click window: 1h sliding, 1m step = 60 windows per key active simultaneously
+- No checkpointing configuration visible
+
+**Why it matters:** If the Flink TaskManager crashes, all in-flight windowed state is lost. With 50M users and 60 active windows per user, the memory footprint is enormous. Without checkpointing, exactly-once semantics are not guaranteed.
+
+**Suggested improvements:**
+- Configure RocksDB state backend for large state (spills to disk)
+- Enable checkpointing (e.g., every 60s to MinIO/S3)
+- Add backpressure monitoring (Flink metrics → Prometheus)
+- Consider reducing window granularity: 1h tumbling instead of 1h sliding with 1m step (60x less state)
+- Add savepoint support for graceful upgrades
+
+---
+
+### 6. Experiment Router: Consistency Issues
+
+**Current state:**
+- Experiment assignment uses FNV-1a hash to bucket 0-99
+- Experiment config cached for 30 seconds with double-checked locking
+- Cache refresh reads from DragonflyDB (`experiment:active` set)
+
+**Why it matters:**
+- **Mid-session reassignment:** If an experiment config changes during a user's session, they could see different treatment groups across requests (30s cache means up to 30s inconsistency)
+- **Bucket collision:** 100 buckets with multiple experiments can cause overlap — no validation that experiments don't claim the same buckets
+- **No exposure logging:** When a user is assigned to an experiment, there's no event emitted to track it — makes A/B analysis unreliable
+
+**Suggested improvements:**
+- Pin experiment assignment per session (not per request) using session ID as part of hash
+- Add bucket overlap validation when loading experiments
+- Emit experiment exposure events to Redpanda for offline analysis
+- Consider sticky assignment via DragonflyDB (write user→experiment mapping on first exposure)
+
+---
+
+### 7. Triton Integration: Placeholder Implementation
+
+**Current state:**
+- `internal/triton/ranker.go` sends requests to Triton gRPC
+- User and item embeddings are **hardcoded as zero vectors** (placeholder)
+- No embedding lookup from Milvus or DragonflyDB before inference
+- Circuit breaker protects the call but sort uses insertion sort (O(n²))
+
+**Why it matters:** Tier 3 inference is the only path for cold-start users, but it currently returns meaningless scores because embeddings are all zeros. The DCN-V2 model expects real 128-dim user + item embeddings and 32-dim context features.
+
+**Suggested improvements:**
+- Implement embedding lookup: user embeddings from DragonflyDB (`feat:user:<id>:embedding`), item embeddings from Milvus or a pre-loaded cache
+- Replace insertion sort with `sort.Slice` (Go stdlib, uses introsort — O(n log n))
+- Add embedding cache with TTL to avoid per-request Milvus lookups
+- Add Triton health check integration (Triton exposes `/v2/health/ready`)
+
+---
+
+### 8. Missing CI/CD Pipeline
+
+**Current state:** No `.github/workflows` directory. No CI configuration of any kind. The Makefile `test` target uses a dash prefix (`-go test`) to ignore failures.
+
+**Why it matters:** No automated quality gates. Broken code can be merged without detection. Test coverage is unknown and unmeasured.
+
+**Suggested improvements:**
+- Add GitHub Actions workflow: lint (golangci-lint, ruff) → test → build → integration test
+- Remove dash prefix from `make test` so failures are caught
+- Add test coverage reporting with minimum threshold (80%)
+- Add container image build and push on tag/release
+- Add k6 smoke test in CI (lightweight version of local-benchmark)
+
+---
+
+### 9. Configuration Validation
+
+**Current state:** Services read environment variables with hardcoded defaults and no validation:
+
+```go
+// event-collector/cmd/server/main.go
+brokers := os.Getenv("REDPANDA_BROKERS")
+if brokers == "" {
+    brokers = "localhost:9092"
+}
+```
+
+No service validates that required dependencies are actually reachable at startup.
+
+**Why it matters:** Silent fallback to `localhost:9092` in a K8s pod means the service starts successfully but silently drops all events. Operators see healthy pods with zero throughput.
+
+**Suggested improvements:**
+- Add startup health checks: ping DragonflyDB, verify Redpanda connectivity, check Triton health before serving traffic
+- Fail fast if required config is missing (no silent defaults for production-critical values)
+- Use a config struct with explicit required/optional fields
+- Add readiness probe that verifies dependency connectivity (not just "process is running")
+
+---
+
+### 10. Stock Bitmap: Scalability Concern
+
+**Current state:**
+- Stock filtering uses a DragonflyDB bitmap + id_map
+- Two-pipeline approach: first fetch bitmap offset via `stock:id_map:<item_id>`, then `GETBIT stock:bitmap <offset>`
+- Fail-open: unknown items assumed in-stock
+
+**Why it matters:** With 1M items, the bitmap itself is only ~125KB (efficient). But the id_map has 1M separate keys (`stock:id_map:i_000001` through `stock:id_map:i_999999`), each consuming DragonflyDB overhead. For 20 recommendations per request at 500K RPS, that's 10M `GET` + 10M `GETBIT` commands per second on DragonflyDB.
+
+**Suggested improvements:**
+- Consolidate id_map into a single hash (`HGET stock:id_map <item_id>`) — reduces key count from 1M to 1
+- Batch both lookups into a single Redis pipeline (currently uses 2 separate pipelines)
+- Consider a local bitmap cache with pub/sub invalidation — stock changes are relatively infrequent compared to read volume
+- Add metrics for bitmap lookup latency and miss rate
+
+---
+
+### 11. Load Testing: Missing Scenarios
+
+**Current state:** 4 k6 scripts exist (local-benchmark, tier-distribution, ramp-up, inventory-stress) + the newly added cdn-bypass-worst-case. All test `/api/v1/recommend` directly.
+
+**Missing scenarios:**
+
+| Scenario | Why It Matters |
+|----------|---------------|
+| DragonflyDB latency injection | What happens when cache reads go from 1ms to 50ms? |
+| Cold-start user flood | 100% new users = 100% cache miss = all traffic hits Tier 3 |
+| Experiment config hot-reload | Does changing experiment config mid-test cause errors? |
+| Multi-endpoint mixed load | Real traffic hits /recommend, /popular, /events simultaneously |
+| Gradual degradation validation | Does the degradation manager actually step through Normal → Warning → Critical → Emergency? |
+| Connection pool exhaustion | What happens when DragonflyDB pool (100) is fully occupied? |
+
+---
+
+### 12. Batch Processor: Incomplete Pipeline
+
+**Current state:**
+- `incremental_4h.py` Airflow DAG is defined but references S3 paths (`s3a://recsys-data/events/incremental/`) that aren't populated by any visible pipeline
+- Daily full recompute DAG structure is implied but not implemented
+- No feature validation or data quality checks between pipeline stages
+
+**Suggested improvements:**
+- Add data quality checks (Great Expectations or custom) between feature computation and embedding stages
+- Implement the daily full recompute DAG with overlap detection (don't recompute if incremental is running)
+- Add feature drift monitoring — alert when feature distributions shift significantly
+- Connect event-collector → MinIO/S3 sink for batch processing input (currently only Redpanda → Flink path exists)
+
+---
+
+### Summary: Priority Matrix
+
+| Priority | Improvement | Effort | Impact |
+|----------|------------|--------|--------|
+| <strong>P0</strong> | Security hardening (secrets, auth, TLS) | Medium | Blocks production |
+| <strong>P0</strong> | DragonflyDB HA + local popular items cache | Medium | Eliminates SPOF |
+| <strong>P0</strong> | CI/CD pipeline | Low | Quality gates |
+| <strong>P1</strong> | Flink state backend + checkpointing | Medium | Data durability |
+| <strong>P1</strong> | Observability (OTLP tracing, structured logs) | Medium | Debuggability |
+| <strong>P1</strong> | Triton embedding lookup implementation | Medium | Tier 3 functionality |
+| <strong>P1</strong> | Configuration validation + startup checks | Low | Operational safety |
+| <strong>P2</strong> | CDN failure testing + extended cache TTL | Low | Resilience |
+| <strong>P2</strong> | Experiment exposure logging + session pinning | Low | A/B reliability |
+| <strong>P2</strong> | Stock bitmap optimization (hash + pipeline merge) | Low | Performance |
+| <strong>P2</strong> | Missing load test scenarios | Medium | Coverage |
+| <strong>P3</strong> | Batch pipeline completion + data quality | High | ML accuracy |
 
 ---
 
